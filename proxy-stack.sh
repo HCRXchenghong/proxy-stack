@@ -333,7 +333,7 @@ local_project_version() {
 remote_project_version() {
   local url
   url="$(project_raw_url VERSION)"
-  curl -fsSL --max-time 15 "$url" | head -n 1 | tr -d '[:space:]'
+  curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 "$url" | head -n 1 | tr -d '[:space:]'
 }
 
 check_project_update() {
@@ -357,7 +357,7 @@ download_project_payload() {
   local tmp archive src
   tmp="$(mktemp -d)"
   archive="$tmp/proxy-stack.tar.gz"
-  curl -fsSL "$(project_tarball_url)" -o "$archive"
+  curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$(project_tarball_url)" -o "$archive"
   tar -xzf "$archive" -C "$tmp"
   src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   [[ -n "$src" ]] || die "解压更新包失败"
