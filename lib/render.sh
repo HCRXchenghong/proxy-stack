@@ -9,7 +9,7 @@ write_xray_config() {
   load_env
 
   local users_json="$STATE_DIR/users.json"
-  [[ -f "$users_json" ]] || die "missing $users_json"
+  [[ -f "$users_json" ]] || die "缺少用户文件：$users_json"
 
   python3 - "$users_json" "$STATE_DIR/xray.json" <<'PY'
 import json
@@ -281,6 +281,7 @@ EOF
 }
 
 write_certbot_hook() {
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
   cat >/etc/letsencrypt/renewal-hooks/deploy/proxy-stack-reload.sh <<'EOF'
 #!/usr/bin/env bash
 set -e

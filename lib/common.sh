@@ -22,18 +22,89 @@ log() {
 }
 
 die() {
-  printf '[proxy-stack] ERROR: %s\n' "$*" >&2
+  printf '[proxy-stack] 错误：%s\n' "$*" >&2
   exit 1
 }
 
 require_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run as root"
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行"
 }
 
 require_cmd() {
   local cmd
   for cmd in "$@"; do
-    command -v "$cmd" >/dev/null 2>&1 || die "missing command: $cmd"
+    command -v "$cmd" >/dev/null 2>&1 || die "缺少命令：$cmd"
+  done
+}
+
+is_placeholder_domain() {
+  local domain
+  domain="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$domain" in
+    example.com|*.example.com|example.net|*.example.net|example.org|*.example.org|localhost|*.localhost|invalid|*.invalid|test|*.test)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_valid_domain() {
+  local domain
+  domain="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$domain" != *"://"* ]] || return 1
+  [[ "$domain" != */* ]] || return 1
+  [[ "$domain" != .* && "$domain" != *. ]] || return 1
+  [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+validate_domain() {
+  local label="$1"
+  local domain="$2"
+  is_valid_domain "$domain" || die "$label 必须是真实域名，不能包含 http:// 或路径：$domain"
+  ! is_placeholder_domain "$domain" || die "$label 仍然是示例/保留域名：$domain"
+}
+
+validate_email() {
+  local label="$1"
+  local email="$2"
+  is_valid_email "$email" || die "$label 必须是有效的真实邮箱地址：$email"
+}
+
+is_valid_email() {
+  local email="$1"
+  local email_domain="${email##*@}"
+  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || return 1
+  ! is_placeholder_domain "$email_domain"
+}
+
+prompt_value_if_tty() {
+  local var_name="$1"
+  local prompt="$2"
+  local current_value="${!var_name:-}"
+  if [[ -n "$current_value" ]]; then
+    return 0
+  fi
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s: ' "$prompt" >/dev/tty
+    IFS= read -r current_value </dev/tty
+  elif [[ -t 0 ]]; then
+    read -r -p "$prompt: " current_value
+  else
+    return 0
+  fi
+  printf -v "$var_name" '%s' "$current_value"
+}
+
+validate_ipv4() {
+  local label="$1"
+  local ip="$2"
+  local IFS=.
+  local -a parts
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "$label 必须是 IPv4 地址：$ip"
+  read -r -a parts <<<"$ip"
+  local part
+  for part in "${parts[@]}"; do
+    (( 10#$part >= 0 && 10#$part <= 255 )) || die "$label 包含无效的 IPv4 数字段：$ip"
   done
 }
 
@@ -43,7 +114,7 @@ ensure_dirs() {
 
 load_env() {
   local env_file="$STATE_DIR/stack.env"
-  [[ -f "$env_file" ]] || die "missing $env_file"
+  [[ -f "$env_file" ]] || die "缺少配置文件：$env_file"
   # shellcheck disable=SC1090
   source "$env_file"
 }
@@ -61,7 +132,13 @@ json_get() {
 }
 
 random_slug() {
-  openssl rand -base64 9 | tr -dc 'a-zA-Z0-9' | head -c 10
+  python3 - <<'PY'
+import secrets
+import string
+
+alphabet = string.ascii_letters + string.digits
+print("".join(secrets.choice(alphabet) for _ in range(10)))
+PY
 }
 
 random_hex() {
@@ -89,6 +166,28 @@ public_ipv4() {
   curl -fsSL --max-time 10 https://api.ipify.org
 }
 
+resolve_domain_ipv4s() {
+  local domain="$1"
+  getent ahostsv4 "$domain" | awk '{print $1}' | sort -u
+}
+
+preflight_acme_dns() {
+  local public_ip="$1"
+  shift
+  local domain ips bad_ips flat_ips
+  for domain in "$@"; do
+    ips="$(resolve_domain_ipv4s "$domain" || true)"
+    if [[ -z "$ips" ]]; then
+      die "$domain 没有 IPv4 A 记录。申请 Let's Encrypt 证书前，请先把它解析到 $public_ip。"
+    fi
+    bad_ips="$(printf '%s\n' "$ips" | grep -Fxv "$public_ip" || true)"
+    if [[ -n "$bad_ips" ]]; then
+      flat_ips="$(printf '%s' "$ips" | paste -sd ',' -)"
+      die "$domain 当前解析到 $flat_ips。申请 Let's Encrypt 证书前，所有 IPv4 A 记录都必须指向本机公网 IP $public_ip。"
+    fi
+  done
+}
+
 ensure_nginx_stream_include() {
   grep -q 'include /etc/nginx/stream-conf.d/\*.conf;' /etc/nginx/nginx.conf && return 0
   python3 - <<'PY'
@@ -112,7 +211,11 @@ PY
 
 reload_nginx() {
   nginx -t
-  systemctl reload nginx
+  if systemctl is-active --quiet nginx; then
+    systemctl reload nginx
+  else
+    systemctl restart nginx
+  fi
 }
 
 systemd_reload() {
@@ -124,6 +227,6 @@ disable_legacy_hcrx_conf() {
   local backup="/etc/nginx/conf.d/hcrx-ltd.conf.proxy-stack.bak"
   if [[ -f "$legacy" ]]; then
     mv "$legacy" "$backup"
-    log "disabled legacy nginx vhost: $legacy -> $backup"
+    log "已禁用旧 nginx 站点配置：$legacy -> $backup"
   fi
 }

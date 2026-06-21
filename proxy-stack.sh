@@ -9,31 +9,31 @@ source "$SCRIPT_DIR/lib/render.sh"
 
 usage() {
   cat <<'EOF'
-Usage:
-  ./proxy-stack.sh install [options]
+用法：
+  ./proxy-stack.sh install [选项]
   ./proxy-stack.sh render
   ./proxy-stack.sh verify
-  ./proxy-stack.sh user add <name>
-  ./proxy-stack.sh user batch-add <prefix> <count> [start]
-  ./proxy-stack.sh user del <name-or-slug>
-  ./proxy-stack.sh user disable <name-or-slug>
-  ./proxy-stack.sh user enable <name-or-slug>
+  ./proxy-stack.sh user add <用户名>
+  ./proxy-stack.sh user batch-add <用户名前缀> <数量> [起始序号]
+  ./proxy-stack.sh user del <用户名或slug>
+  ./proxy-stack.sh user disable <用户名或slug>
+  ./proxy-stack.sh user enable <用户名或slug>
   ./proxy-stack.sh user list
-  ./proxy-stack.sh user show <name-or-slug>
-  ./proxy-stack.sh user share <name-or-slug>
-  ./proxy-stack.sh user export [csv|json|text] [path]
+  ./proxy-stack.sh user show <用户名或slug>
+  ./proxy-stack.sh user share <用户名或slug>
+  ./proxy-stack.sh user export [csv|json|text] [路径]
   ./proxy-stack.sh uninstall-3xui
   ./proxy-stack.sh package
 
-Install options:
-  --web-domain <domain>
-  --management-domain <domain>
-  --cert-email <email>
-  --tls-cert-file <path>
-  --tls-key-file <path>
-  --public-ip <ip>
-  --reality-target <host:port>
-  --reality-sni <host>
+安装选项：
+  --web-domain <域名>            用户交付页/订阅使用的公网域名。
+  --management-domain <域名>     管理域名，会转发到 127.0.0.1:8317。
+  --cert-email <邮箱>            Let's Encrypt 注册邮箱；交互式终端中省略时会提示输入。
+  --tls-cert-file <路径>         已有 TLS fullchain 证书路径。
+  --tls-key-file <路径>          已有 TLS 私钥路径。
+  --public-ip <ip>               服务器公网 IP；省略时自动探测。
+  --reality-target <host:port>   REALITY 伪装目标。
+  --reality-sni <host>           REALITY SNI。
 EOF
 }
 
@@ -43,14 +43,14 @@ download_xray() {
   api='https://api.github.com/repos/XTLS/Xray-core/releases/latest'
   tag="$(curl -fsSL "$api" | jq -r '.tag_name')"
   url="$(curl -fsSL "$api" | jq -r '.assets[] | select(.name=="Xray-linux-64.zip") | .browser_download_url')"
-  [[ -n "$tag" && -n "$url" ]] || die "unable to resolve latest xray release"
+  [[ -n "$tag" && -n "$url" ]] || die "无法解析最新版 Xray 下载地址"
   tmp="$(mktemp -d)"
   zip="$tmp/xray.zip"
   curl -fsSL "$url" -o "$zip"
   unzip -qo "$zip" -d "$tmp/unpack"
   install -m 0755 "$tmp/unpack/xray" "${BIN_DIR}/xray"
   rm -rf "$tmp"
-  log "installed xray ${tag}"
+  log "已安装 Xray ${tag}"
 }
 
 download_hysteria() {
@@ -59,28 +59,33 @@ download_hysteria() {
   api='https://api.github.com/repos/apernet/hysteria/releases/latest'
   tag="$(curl -fsSL "$api" | jq -r '.tag_name')"
   url="$(curl -fsSL "$api" | jq -r '.assets[] | select(.name=="hysteria-linux-amd64") | .browser_download_url')"
-  [[ -n "$tag" && -n "$url" ]] || die "unable to resolve latest hysteria release"
+  [[ -n "$tag" && -n "$url" ]] || die "无法解析最新版 Hysteria 下载地址"
   tmp="$(mktemp)"
   curl -fsSL "$url" -o "$tmp"
   install -m 0755 "$tmp" "${BIN_DIR}/hysteria"
   rm -f "$tmp"
-  log "installed hysteria ${tag}"
+  log "已安装 Hysteria ${tag}"
 }
 
 issue_cert_if_needed() {
   local cert="$1" key="$2" email="$3" web_domain="$4" mgmt_domain="$5"
   if [[ -f "$cert" && -f "$key" ]]; then
-    log "reusing existing TLS cert/key"
+    log "复用已有 TLS 证书和私钥"
     return 0
   fi
-  [[ -n "$email" ]] || die "cert email required when cert paths are absent"
+  [[ -n "$email" ]] || die "未提供证书路径时必须提供证书邮箱"
+  rm -f "$NGINX_HTTP_CONF"
   mkdir -p "$WEB_ROOT/.well-known/acme-challenge"
   write_nginx_acme_conf
   reload_nginx
-  certbot certonly --webroot -w "$WEB_ROOT" \
+  log "正在为 ${web_domain} 和 ${mgmt_domain} 申请 Let's Encrypt 证书"
+  if ! certbot certonly --webroot -w "$WEB_ROOT" \
     -d "$web_domain" -d "$mgmt_domain" \
     --cert-name "$web_domain" \
-    --agree-tos --non-interactive -m "$email"
+    --preferred-challenges http \
+    --agree-tos --no-eff-email --non-interactive --expand -m "$email"; then
+    die "Let's Encrypt 证书申请失败。请确认两个域名都解析到本机、TCP 80 已放行、Cloudflare 代理云朵已关闭，并且 $email 是真实邮箱。详情见：/var/log/letsencrypt/letsencrypt.log"
+  fi
 }
 
 generate_env_file() {
@@ -89,7 +94,7 @@ generate_env_file() {
   out="$("${BIN_DIR}/xray" x25519)"
   private="$(printf '%s\n' "$out" | awk 'index($0,"PrivateKey:")==1 {print $2}')"
   public="$(printf '%s\n' "$out" | awk 'index($0,"Password (PublicKey):")==1 {print $3}')"
-  [[ -n "$private" && -n "$public" ]] || die "failed to generate reality x25519 keypair"
+  [[ -n "$private" && -n "$public" ]] || die "生成 REALITY x25519 密钥对失败"
   short="$(random_hex 4)"
   obfs="$(random_token 12)"
   save_env <<EOF
@@ -116,6 +121,7 @@ install_stack() {
   require_root
   require_cmd bash curl openssl python3 systemctl apt-get
   local web_domain="" mgmt_domain="" cert_email="" tls_cert="" tls_key="" public_ip="" reality_target="" reality_sni=""
+  local using_existing_tls=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --web-domain) web_domain="$2"; shift 2 ;;
@@ -126,12 +132,39 @@ install_stack() {
       --public-ip) public_ip="$2"; shift 2 ;;
       --reality-target) reality_target="$2"; shift 2 ;;
       --reality-sni) reality_sni="$2"; shift 2 ;;
-      *) die "unknown install option: $1" ;;
+      *) die "未知安装选项：$1" ;;
     esac
   done
-  [[ -n "$web_domain" ]] || die "--web-domain required"
-  [[ -n "$mgmt_domain" ]] || die "--management-domain required"
+  [[ -n "$web_domain" ]] || die "必须提供 --web-domain"
+  [[ -n "$mgmt_domain" ]] || die "必须提供 --management-domain"
+  validate_domain "--web-domain" "$web_domain"
+  validate_domain "--management-domain" "$mgmt_domain"
+  [[ "$web_domain" != "$mgmt_domain" ]] || die "用户域名和管理域名不能相同"
+  if [[ -n "$tls_cert" || -n "$tls_key" ]]; then
+    using_existing_tls=1
+    [[ -n "$tls_cert" && -n "$tls_key" ]] || die "请同时提供 --tls-cert-file 和 --tls-key-file"
+    [[ -f "$tls_cert" ]] || die "TLS 证书文件不存在：$tls_cert"
+    [[ -f "$tls_key" ]] || die "TLS 私钥文件不存在：$tls_key"
+  else
+    while ! is_valid_email "$cert_email"; do
+      if [[ -n "$cert_email" ]]; then
+        log "证书邮箱 '$cert_email' 无效或属于保留域名，请输入真实邮箱"
+        cert_email=""
+      fi
+      prompt_value_if_tty cert_email "请输入 Let's Encrypt 邮箱"
+      [[ -n "$cert_email" ]] || break
+    done
+    [[ -n "$cert_email" ]] || die "未提供 TLS 证书/私钥时必须提供 --cert-email"
+    validate_email "--cert-email" "$cert_email"
+  fi
   ensure_dirs
+  if [[ -z "$public_ip" ]]; then
+    public_ip="$(public_ipv4)" || die "自动探测公网 IPv4 失败，请传入 --public-ip <ip>"
+  fi
+  validate_ipv4 "--public-ip" "$public_ip"
+  if [[ "$using_existing_tls" -eq 0 ]]; then
+    preflight_acme_dns "$public_ip" "$web_domain" "$mgmt_domain"
+  fi
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip nginx libnginx-mod-stream certbot python3-certbot-nginx python3
   require_cmd jq unzip nginx certbot
@@ -139,7 +172,6 @@ install_stack() {
   systemctl enable --now nginx
   download_xray
   download_hysteria
-  [[ -n "$public_ip" ]] || public_ip="$(public_ipv4)"
   [[ -n "$reality_target" ]] || reality_target="www.amazon.com:443"
   [[ -n "$reality_sni" ]] || reality_sni="www.amazon.com"
   if [[ -z "$tls_cert" || -z "$tls_key" ]]; then
@@ -155,7 +187,7 @@ install_stack() {
   render_stack
   systemctl enable --now proxy-stack-xray proxy-stack-hysteria proxy-stack-web
   reload_nginx
-  log "install complete"
+  log "安装完成"
 }
 
 render_stack() {
@@ -166,7 +198,7 @@ render_stack() {
   write_nginx_http_conf
   write_nginx_stream_conf
   write_systemd_units
-  log "render complete"
+  log "配置渲染完成"
 }
 
 verify_stack() {
@@ -179,7 +211,7 @@ verify_stack() {
   systemctl is-active --quiet proxy-stack-hysteria
   systemctl is-active --quiet proxy-stack-web
   systemctl is-active --quiet nginx
-  log "verify passed"
+  log "验证通过"
 }
 
 wait_stack_ready() {
@@ -194,7 +226,7 @@ wait_stack_ready() {
     fi
     sleep 1
   done
-  die "proxy stack services failed to become ready"
+  die "Proxy Stack 服务未能在预期时间内就绪"
 }
 
 reload_stack_services() {
@@ -207,20 +239,20 @@ write_runtime_info() {
   load_env
   local info_file="/root/proxy-stack-runtime-info.txt"
   {
-    printf 'Generated: %s UTC\n' "$(date -u '+%Y-%m-%d %H:%M:%S')"
-    printf 'Project: /root/proxy-stack\n'
-    printf 'Package: /root/proxy-stack-project.tar.gz\n'
-    printf 'Web domain: %s\n' "$WEB_DOMAIN"
-    printf 'Management domain: %s\n' "$MANAGEMENT_DOMAIN"
-    printf 'Public IP: %s\n' "$PUBLIC_IP"
-    printf 'User list command: bash /root/proxy-stack/proxy-stack.sh user list\n'
+    printf '生成时间：%s UTC\n' "$(date -u '+%Y-%m-%d %H:%M:%S')"
+    printf '项目目录：/root/proxy-stack\n'
+    printf '项目压缩包：/root/proxy-stack-project.tar.gz\n'
+    printf '用户域名：%s\n' "$WEB_DOMAIN"
+    printf '管理域名：%s\n' "$MANAGEMENT_DOMAIN"
+    printf '公网 IP：%s\n' "$PUBLIC_IP"
+    printf '用户列表命令：bash /root/proxy-stack/proxy-stack.sh user list\n'
   } >"$info_file"
   chmod 600 "$info_file"
 }
 
 user_add() {
   require_root
-  local name="${1:?name required}"
+  local name="${1:?必须提供用户名}"
   local slug uuid hy2
   slug="$(random_slug)"
   uuid="$(random_uuid)"
@@ -236,7 +268,7 @@ data = json.loads(path.read_text())
 users = data.setdefault("users", [])
 for user in users:
     if user["name"] == name:
-        raise SystemExit("user already exists")
+        raise SystemExit("用户已存在")
 users.append({
     "name": name,
     "slug": slug,
@@ -254,8 +286,8 @@ PY
 
 user_batch_add() {
   require_root
-  local prefix="${1:?prefix required}"
-  local count="${2:?count required}"
+  local prefix="${1:?必须提供用户名前缀}"
+  local count="${2:?必须提供数量}"
   local start="${3:-1}"
   python3 - "$STATE_DIR/users.json" "$prefix" "$count" "$start" <<'PY'
 import json
@@ -270,7 +302,7 @@ prefix = sys.argv[2]
 count = int(sys.argv[3])
 start = int(sys.argv[4])
 if count <= 0:
-    raise SystemExit("count must be > 0")
+    raise SystemExit("数量必须大于 0")
 alphabet = string.ascii_letters + string.digits
 
 def rand_slug():
@@ -286,7 +318,7 @@ created = []
 for idx in range(start, start + count):
     name = f"{prefix}{idx:03d}"
     if name in existing:
-      raise SystemExit(f"user already exists: {name}")
+      raise SystemExit(f"用户已存在：{name}")
     users.append({
         "name": name,
         "slug": rand_slug(),
@@ -301,13 +333,13 @@ PY
   render_stack
   reload_stack_services
   write_runtime_info
-  log "batch users created with prefix ${prefix}"
+  log "已批量创建前缀为 ${prefix} 的用户"
 }
 
 user_set_enabled() {
   require_root
-  local key="${1:?user key required}"
-  local want="${2:?enabled flag required}"
+  local key="${1:?必须提供用户名称或 slug}"
+  local want="${2:?必须提供启用状态}"
   python3 - "$STATE_DIR/users.json" "$key" "$want" <<'PY'
 import json
 import sys
@@ -324,7 +356,7 @@ for user in users:
         path.write_text(json.dumps(data, indent=2))
         print(json.dumps(user))
         raise SystemExit(0)
-raise SystemExit("user not found")
+raise SystemExit("用户不存在")
 PY
   render_stack
   reload_stack_services
@@ -334,7 +366,7 @@ PY
 
 user_del() {
   require_root
-  local key="${1:?user key required}"
+  local key="${1:?必须提供用户名称或 slug}"
   python3 - "$STATE_DIR/users.json" "$key" <<'PY'
 import json
 import sys
@@ -346,24 +378,24 @@ data = json.loads(path.read_text())
 users = data.setdefault("users", [])
 filtered = [u for u in users if u.get("name") != key and u.get("slug") != key]
 if len(filtered) == len(users):
-    raise SystemExit("user not found")
+    raise SystemExit("用户不存在")
 data["users"] = filtered
 path.write_text(json.dumps(data, indent=2))
 PY
   render_stack
   reload_stack_services
   write_runtime_info
-  log "user removed: ${key}"
+  log "已删除用户：${key}"
 }
 
 user_list() {
   require_root
-  jq -r '.users[] | [.name, .slug, .enabled] | @tsv' "$STATE_DIR/users.json"
+  jq -r '.users[] | [.name, .slug, (if .enabled then "启用" else "禁用" end)] | @tsv' "$STATE_DIR/users.json"
 }
 
 user_show() {
   require_root
-  local key="${1:?user key required}"
+  local key="${1:?必须提供用户名称或 slug}"
   load_env
   python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" <<'PY'
 import json
@@ -379,7 +411,7 @@ for item in users:
         u = item
         break
 if not u:
-    raise SystemExit("user not found")
+    raise SystemExit("用户不存在")
 vless = (
     f'vless://{u["vless_uuid"]}@{public_ip}:443'
     f'?type=tcp&security=reality&pbk={quote(pbk)}&fp=chrome'
@@ -406,7 +438,7 @@ PY
 
 user_share() {
   require_root
-  local key="${1:?user key required}"
+  local key="${1:?必须提供用户名称或 slug}"
   load_env
   python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" <<'PY'
 import json
@@ -422,7 +454,7 @@ for item in users:
         u = item
         break
 if not u:
-    raise SystemExit("user not found")
+    raise SystemExit("用户不存在")
 vless = (
     f'vless://{u["vless_uuid"]}@{public_ip}:443'
     f'?type=tcp&security=reality&pbk={quote(pbk)}&fp=chrome'
@@ -467,7 +499,7 @@ user_export() {
       [[ -n "$out_path" ]] || out_path="/root/proxy-stack-users.txt"
       ;;
     *)
-      die "unsupported export format: $format"
+      die "不支持的导出格式：$format"
       ;;
   esac
   python3 - "$STATE_DIR/users.json" "$format" "$out_path" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" <<'PY'
@@ -523,7 +555,7 @@ else:
         for row in rows:
             f.write(
                 f"[{row['name']}]\n"
-                f"状态: {'enabled' if row['enabled'] else 'disabled'}\n"
+                f"状态: {'启用' if row['enabled'] else '禁用'}\n"
                 f"页面: {row['page']}\n"
                 f"通用订阅: {row['sub']}\n"
                 f"Clash/Mihomo: {row['clash']}\n"
@@ -549,13 +581,13 @@ uninstall_3xui() {
   rm -f /etc/fail2ban/jail.d/xui-login.local /etc/fail2ban/filter.d/xui-login.conf /etc/fail2ban/action.d/nginx-cn2-deny.conf
   systemctl restart fail2ban || true
   systemctl daemon-reload
-  log "3x-ui removed"
+  log "3x-ui 已清理"
 }
 
 package_project() {
   require_root
   tar -C /root -czf /root/proxy-stack-project.tar.gz proxy-stack
-  log "package written to /root/proxy-stack-project.tar.gz"
+  log "项目压缩包已写入 /root/proxy-stack-project.tar.gz"
 }
 
 cmd="${1:-}"

@@ -34,10 +34,25 @@ Ubuntu 一键部署 VLESS + REALITY + Vision、Hysteria2、短链接交付页、
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/deploy.sh \
   | sudo bash -s -- \
-    --web-domain sub.example.com \
-    --management-domain panel.example.com \
-    --cert-email admin@example.com
+    --web-domain sub.your-domain.com \
+    --management-domain panel.your-domain.com \
+    --cert-email admin@your-domain.com
 ```
+
+请把上面的域名和邮箱换成真实值，不能直接使用 `example.com` 示例域名或 `admin@example.com` 示例邮箱。也可以省略 `--cert-email`，脚本会提示输入真实邮箱：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/deploy.sh \
+  | sudo bash -s -- \
+    --web-domain sub.your-domain.com \
+    --management-domain panel.your-domain.com
+```
+
+脚本会在安装前检查：
+
+- 两个域名格式正确，且不是 `example.com`、`localhost`、`.test` 等保留/示例域名。
+- 证书邮箱格式正确，且不是示例邮箱。
+- 自动申请证书时，两个域名的 IPv4 A 记录都已解析到本机公网 IP。
 
 脚本会把项目下载到 `/root/proxy-stack`，安装依赖，下载 Xray 和 Hysteria2，申请证书，写入 nginx/systemd 配置并启动服务。
 
@@ -45,9 +60,9 @@ curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/depl
 
 ```bash
 sudo bash deploy.sh \
-  --web-domain sub.example.com \
-  --management-domain panel.example.com \
-  --cert-email admin@example.com
+  --web-domain sub.your-domain.com \
+  --management-domain panel.your-domain.com \
+  --cert-email admin@your-domain.com
 ```
 
 可选参数：
@@ -166,7 +181,7 @@ sudo nginx -t
 
 常见问题：
 
-- 证书申请失败：确认两个域名都解析到本机，TCP 80 已放行，Cloudflare 为 DNS only。
+- 证书申请失败：确认两个域名都解析到本机公网 IPv4，TCP 80 已放行，Cloudflare 为 DNS only，邮箱不是 `admin@example.com` 这类示例邮箱。
 - 页面打不开：确认 TCP 443 已放行，`nginx -t` 通过，`proxy-stack-web` 正常运行。
 - Hysteria2 不通：确认 UDP 443 已放行，并检查云厂商安全组。
 - VLESS 不通：确认客户端使用 REALITY public key、short id、SNI 和 Vision flow。
