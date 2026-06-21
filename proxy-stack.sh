@@ -336,16 +336,51 @@ remote_project_version() {
   curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 "$url" | head -n 1 | tr -d '[:space:]'
 }
 
+compare_project_versions() {
+  local local_version="$1"
+  local remote_version="$2"
+  if [[ "$local_version" == "unknown" ]]; then
+    printf -- '-1\n'
+    return 0
+  fi
+  python3 - "$local_version" "$remote_version" <<'PY'
+import re
+import sys
+
+left, right = sys.argv[1:3]
+
+def parts(value):
+    return [int(item) for item in re.findall(r"\d+", value)]
+
+a = parts(left)
+b = parts(right)
+size = max(len(a), len(b))
+a += [0] * (size - len(a))
+b += [0] * (size - len(b))
+if a < b:
+    print(-1)
+elif a > b:
+    print(1)
+else:
+    print(0)
+PY
+}
+
 check_project_update() {
-  require_cmd curl
-  local local_version remote_version
+  require_cmd curl python3
+  local local_version remote_version compare_result
   local_version="$(local_project_version)"
   remote_version="$(remote_project_version)" || die "检测远程版本失败，请检查网络或仓库地址"
   [[ -n "$remote_version" ]] || die "远程 VERSION 为空，无法检测更新"
   printf '当前版本：%s\n' "$local_version"
   printf '远程版本：%s\n' "$remote_version"
-  if [[ "$local_version" == "$remote_version" ]]; then
+  compare_result="$(compare_project_versions "$local_version" "$remote_version")"
+  if [[ "$compare_result" == "0" ]]; then
     log "当前已是最新版本"
+    return 0
+  fi
+  if [[ "$compare_result" == "1" ]]; then
+    log "本地版本高于远程 VERSION，可能是 GitHub raw 缓存尚未刷新"
     return 0
   fi
   log "发现可用更新：${local_version} -> ${remote_version}"
@@ -370,14 +405,19 @@ download_project_payload() {
 
 update_project() {
   require_root
-  require_cmd curl tar systemctl
-  local local_version remote_version
+  require_cmd curl tar systemctl python3
+  local local_version remote_version compare_result
   local_version="$(local_project_version)"
   remote_version="$(remote_project_version)" || die "检测远程版本失败，请检查网络或仓库地址"
   [[ -n "$remote_version" ]] || die "远程 VERSION 为空，无法更新"
+  compare_result="$(compare_project_versions "$local_version" "$remote_version")"
 
-  if [[ "$local_version" == "$remote_version" ]]; then
+  if [[ "$compare_result" == "0" ]]; then
     log "当前已是最新版本：$local_version"
+    return 0
+  fi
+  if [[ "$compare_result" == "1" ]]; then
+    log "本地版本 $local_version 高于远程 VERSION $remote_version，暂不更新。请稍后再试。"
     return 0
   fi
 
