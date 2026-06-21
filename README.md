@@ -54,6 +54,8 @@ curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/depl
 - 证书邮箱格式正确，且不是示例邮箱。
 - 自动申请证书时，两个域名的 IPv4 A 记录都已解析到本机公网 IP。
 
+脚本的交互提示、错误提示和帮助信息均为中文。使用 `curl | sudo bash` 管道安装时，省略 `--cert-email` 也会从当前终端提示输入真实邮箱；如果是在完全非交互环境中运行，请显式传入 `--cert-email`。
+
 脚本会把项目下载到 `/root/proxy-stack`，安装依赖，下载 Xray 和 Hysteria2，申请证书，写入 nginx/systemd 配置并启动服务。
 
 也可以先克隆/上传项目后本地部署：
@@ -125,6 +127,8 @@ sudo bash /root/proxy-stack/proxy-stack.sh user enable alice
 sudo bash /root/proxy-stack/proxy-stack.sh user del alice
 sudo bash /root/proxy-stack/proxy-stack.sh user export csv /root/proxy-stack-users.csv
 ```
+
+`user list` 输出三列：用户名、slug、状态。状态会显示为 `启用` 或 `禁用`。
 
 修改 `/etc/proxy-stack/stack.env` 或手动调整用户文件后，重新渲染并重启：
 
