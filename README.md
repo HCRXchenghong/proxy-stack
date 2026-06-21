@@ -10,6 +10,7 @@ Ubuntu 一键部署 VLESS + REALITY + Vision、Hysteria2、短链接交付页、
 - 订阅输出：通用 base64 URI、原始 URI、Mihomo/Clash Meta YAML。
 - 自动申请 Let's Encrypt 证书，并配置续期后的服务重载。
 - 部署完成后自动验证服务，并进入中文管理菜单；后续输入 `seroncheng` 即可唤起菜单。
+- 支持脚本版本检测和一键更新，更新时保留现有用户、REALITY/Hysteria2 密钥和证书配置。
 - 用户管理：新增、批量新增、禁用、启用、删除、导出。
 
 ## 系统要求
@@ -99,6 +100,18 @@ systemctl status proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
 seroncheng
 ```
 
+检测脚本更新：
+
+```bash
+sudo bash /root/proxy-stack/proxy-stack.sh check-update
+```
+
+一键更新脚本并重新渲染、重启、验证服务：
+
+```bash
+sudo bash /root/proxy-stack/proxy-stack.sh update
+```
+
 主要运行文件：
 
 ```text
@@ -150,7 +163,7 @@ sudo bash /root/proxy-stack/proxy-stack.sh render
 sudo systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
 ```
 
-也可以直接输入 `seroncheng`，在菜单里完成新增用户、批量新增、启用/禁用、删除、导出、验证服务、查看 SSL 状态和续签测试。
+也可以直接输入 `seroncheng`，在菜单里完成新增用户、批量新增、启用/禁用、删除、导出、验证服务、查看 SSL 状态、续签测试、检测脚本更新和一键更新。
 
 ## SSL 自动续签
 

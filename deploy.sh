@@ -181,6 +181,7 @@ copy_local_payload() {
     cp -a "$src/proxy-stack.sh" "$src/app.py" "$src/lib" "$dst/"
     [[ -f "$src/README.md" ]] && cp -a "$src/README.md" "$dst/"
     [[ -f "$src/deploy.sh" ]] && cp -a "$src/deploy.sh" "$dst/"
+    [[ -f "$src/VERSION" ]] && cp -a "$src/VERSION" "$dst/"
   fi
   chmod 0755 "$dst/proxy-stack.sh"
   [[ -f "$dst/deploy.sh" ]] && chmod 0755 "$dst/deploy.sh"

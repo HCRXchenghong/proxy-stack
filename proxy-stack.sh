@@ -7,12 +7,18 @@ source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/render.sh"
 
+PROJECT_REPO_URL="${PROXY_STACK_REPO_URL:-https://github.com/HCRXchenghong/proxy-stack}"
+PROJECT_BRANCH="${PROXY_STACK_BRANCH:-main}"
+PROJECT_VERSION_FILE="$SCRIPT_DIR/VERSION"
+
 usage() {
   cat <<'EOF'
 用法：
   ./proxy-stack.sh install [选项]
   ./proxy-stack.sh render
   ./proxy-stack.sh verify
+  ./proxy-stack.sh check-update
+  ./proxy-stack.sh update
   ./proxy-stack.sh user add <用户名>
   ./proxy-stack.sh user batch-add <用户名前缀> <数量> [起始序号]
   ./proxy-stack.sh user del <用户名或slug>
@@ -92,12 +98,26 @@ issue_cert_if_needed() {
 generate_env_file() {
   local web_domain="$1" mgmt_domain="$2" cert_email="$3" tls_cert="$4" tls_key="$5" public_ip="$6" reality_target="$7" reality_sni="$8"
   local private public short obfs out
-  out="$("${BIN_DIR}/xray" x25519)"
-  private="$(printf '%s\n' "$out" | awk 'index($0,"PrivateKey:")==1 {print $2}')"
-  public="$(printf '%s\n' "$out" | awk 'index($0,"Password (PublicKey):")==1 {print $3}')"
-  [[ -n "$private" && -n "$public" ]] || die "生成 REALITY x25519 密钥对失败"
-  short="$(random_hex 4)"
-  obfs="$(random_token 12)"
+  private=""
+  public=""
+  short=""
+  obfs=""
+  if [[ -f "$STATE_DIR/stack.env" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_DIR/stack.env"
+    private="${REALITY_PRIVATE_KEY:-}"
+    public="${REALITY_PUBLIC_KEY:-}"
+    short="${REALITY_SHORT_ID:-}"
+    obfs="${HY2_OBFS_PASSWORD:-}"
+  fi
+  if [[ -z "$private" || -z "$public" ]]; then
+    out="$("${BIN_DIR}/xray" x25519)"
+    private="$(printf '%s\n' "$out" | awk 'index($0,"PrivateKey:")==1 {print $2}')"
+    public="$(printf '%s\n' "$out" | awk 'index($0,"Password (PublicKey):")==1 {print $3}')"
+    [[ -n "$private" && -n "$public" ]] || die "生成 REALITY x25519 密钥对失败"
+  fi
+  [[ -n "$short" ]] || short="$(random_hex 4)"
+  [[ -n "$obfs" ]] || obfs="$(random_token 12)"
   save_env <<EOF
 WEB_DOMAIN=${web_domain}
 MANAGEMENT_DOMAIN=${mgmt_domain}
@@ -277,6 +297,100 @@ EOF
   log "已安装管理入口：seroncheng"
 }
 
+normalize_project_repo_url() {
+  local repo="$PROJECT_REPO_URL"
+  repo="${repo%.git}"
+  printf '%s\n' "$repo"
+}
+
+project_raw_url() {
+  local path="$1"
+  local repo owner name
+  repo="$(normalize_project_repo_url)"
+  if [[ "$repo" =~ ^https://github.com/([^/]+)/([^/]+)$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    name="${BASH_REMATCH[2]}"
+    printf 'https://raw.githubusercontent.com/%s/%s/%s/%s\n' "$owner" "$name" "$PROJECT_BRANCH" "$path"
+  else
+    printf '%s/raw/%s/%s\n' "$repo" "$PROJECT_BRANCH" "$path"
+  fi
+}
+
+project_tarball_url() {
+  local repo
+  repo="$(normalize_project_repo_url)"
+  printf '%s/archive/refs/heads/%s.tar.gz\n' "$repo" "$PROJECT_BRANCH"
+}
+
+local_project_version() {
+  if [[ -f "$PROJECT_VERSION_FILE" ]]; then
+    head -n 1 "$PROJECT_VERSION_FILE" | tr -d '[:space:]'
+  else
+    printf 'unknown'
+  fi
+}
+
+remote_project_version() {
+  local url
+  url="$(project_raw_url VERSION)"
+  curl -fsSL --max-time 15 "$url" | head -n 1 | tr -d '[:space:]'
+}
+
+check_project_update() {
+  require_cmd curl
+  local local_version remote_version
+  local_version="$(local_project_version)"
+  remote_version="$(remote_project_version)" || die "检测远程版本失败，请检查网络或仓库地址"
+  [[ -n "$remote_version" ]] || die "远程 VERSION 为空，无法检测更新"
+  printf '当前版本：%s\n' "$local_version"
+  printf '远程版本：%s\n' "$remote_version"
+  if [[ "$local_version" == "$remote_version" ]]; then
+    log "当前已是最新版本"
+    return 0
+  fi
+  log "发现可用更新：${local_version} -> ${remote_version}"
+  return 0
+}
+
+download_project_payload() {
+  local dst="$1"
+  local tmp archive src
+  tmp="$(mktemp -d)"
+  archive="$tmp/proxy-stack.tar.gz"
+  curl -fsSL "$(project_tarball_url)" -o "$archive"
+  tar -xzf "$archive" -C "$tmp"
+  src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  [[ -n "$src" ]] || die "解压更新包失败"
+  mkdir -p "$dst"
+  cp -a "$src/." "$dst/"
+  chmod 0755 "$dst/proxy-stack.sh"
+  [[ -f "$dst/deploy.sh" ]] && chmod 0755 "$dst/deploy.sh"
+  rm -rf "$tmp"
+}
+
+update_project() {
+  require_root
+  require_cmd curl tar systemctl
+  local local_version remote_version
+  local_version="$(local_project_version)"
+  remote_version="$(remote_project_version)" || die "检测远程版本失败，请检查网络或仓库地址"
+  [[ -n "$remote_version" ]] || die "远程 VERSION 为空，无法更新"
+
+  if [[ "$local_version" == "$remote_version" ]]; then
+    log "当前已是最新版本：$local_version"
+    return 0
+  fi
+
+  log "开始更新 Proxy Stack：${local_version} -> ${remote_version}"
+  download_project_payload "$SCRIPT_DIR"
+  install_launcher
+  ensure_certbot_auto_renewal
+  bash "$SCRIPT_DIR/proxy-stack.sh" render
+  systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
+  bash "$SCRIPT_DIR/proxy-stack.sh" verify
+  log "更新完成，当前版本：${remote_version}"
+}
+
 has_interactive_tty() {
   [[ -r /dev/tty && -w /dev/tty ]] || [[ -t 0 ]]
 }
@@ -319,6 +433,7 @@ menu_header() {
 用户域名：${WEB_DOMAIN}
 管理域名：${MANAGEMENT_DOMAIN}
 公网 IP：${PUBLIC_IP}
+脚本版本：$(local_project_version)
 后续可在命令行输入：seroncheng
 ================================================================
 EOF
@@ -372,6 +487,8 @@ menu_loop() {
 11) 重新渲染配置并重启服务
 12) 查看 SSL 证书和自动续签状态
 13) 执行 SSL 自动续签测试（dry-run）
+14) 检测脚本更新
+15) 一键更新脚本
 0) 退出
 EOF
     read_menu_input choice "请选择操作："
@@ -443,6 +560,14 @@ EOF
         ;;
       13)
         run_menu_command run_certbot_dry_run
+        pause_menu
+        ;;
+      14)
+        run_menu_command check_project_update
+        pause_menu
+        ;;
+      15)
+        run_menu_command update_project
         pause_menu
         ;;
       0|q|Q)
@@ -811,6 +936,8 @@ case "$cmd" in
   install) shift; install_stack "$@" ;;
   render) render_stack ;;
   verify) verify_stack ;;
+  check-update) check_project_update ;;
+  update) update_project ;;
   menu) menu_loop ;;
   user)
     sub="${2:-}"
