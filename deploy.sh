@@ -29,7 +29,7 @@ is_placeholder_domain() {
   local domain
   domain="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$domain" in
-    example.com|*.example.com|example.net|*.example.net|example.org|*.example.org|localhost|*.localhost|invalid|*.invalid|test|*.test)
+    example.com|*.example.com|example.net|*.example.net|example.org|*.example.org|your-domain.com|*.your-domain.com|your-real-domain.com|*.your-real-domain.com|localhost|*.localhost|invalid|*.invalid|test|*.test)
       return 0
       ;;
   esac
@@ -69,7 +69,7 @@ is_valid_cert_email() {
 usage() {
   cat <<'EOF'
 用法：
-  sudo bash deploy.sh --web-domain <域名> --management-domain <域名> [--cert-email <邮箱>]
+  sudo bash deploy.sh [--web-domain <域名>] [--management-domain <域名>] [--cert-email <邮箱>]
 
 选项：
   --web-domain <域名>            用户交付页/订阅使用的公网域名。

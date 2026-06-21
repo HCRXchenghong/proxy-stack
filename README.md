@@ -32,29 +32,32 @@ Ubuntu 一键部署 VLESS + REALITY + Vision、Hysteria2、短链接交付页、
 在服务器上执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/deploy.sh \
-  | sudo bash -s -- \
-    --web-domain sub.your-domain.com \
-    --management-domain panel.your-domain.com \
-    --cert-email admin@your-domain.com
+curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/deploy.sh | sudo bash
 ```
 
-请把上面的域名和邮箱换成真实值，不能直接使用 `example.com` 示例域名或 `admin@example.com` 示例邮箱。也可以省略 `--cert-email`，脚本会提示输入真实邮箱：
+脚本会用中文提示依次输入：
+
+- 用户交付页/订阅域名，例如 `sub.你的真实域名.com`。
+- 管理域名，例如 `panel.你的真实域名.com`。
+- Let's Encrypt 真实邮箱。
+
+也可以非交互传参部署，注意必须把下面三项换成自己的真实值，不能直接使用 `example.com`、`your-domain.com` 这类占位域名或 `admin@example.com` 示例邮箱：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/deploy.sh \
   | sudo bash -s -- \
-    --web-domain sub.your-domain.com \
-    --management-domain panel.your-domain.com
+    --web-domain sub.你的真实域名.com \
+    --management-domain panel.你的真实域名.com \
+    --cert-email admin@你的真实域名.com
 ```
 
 脚本会在安装前检查：
 
-- 两个域名格式正确，且不是 `example.com`、`localhost`、`.test` 等保留/示例域名。
+- 两个域名格式正确，且不是 `example.com`、`your-domain.com`、`localhost`、`.test` 等保留/示例域名。
 - 证书邮箱格式正确，且不是示例邮箱。
 - 自动申请证书时，两个域名的 IPv4 A 记录都已解析到本机公网 IP。
 
-脚本的交互提示、错误提示和帮助信息均为中文。使用 `curl | sudo bash` 管道安装时，省略 `--cert-email` 也会从当前终端提示输入真实邮箱；如果是在完全非交互环境中运行，请显式传入 `--cert-email`。
+脚本的交互提示、错误提示和帮助信息均为中文。使用 `curl | sudo bash` 管道安装时，省略参数也会从当前终端提示输入；如果是在完全非交互环境中运行，请显式传入 `--web-domain`、`--management-domain` 和 `--cert-email`。
 
 脚本会把项目下载到 `/root/proxy-stack`，安装依赖，下载 Xray 和 Hysteria2，申请证书，写入 nginx/systemd 配置并启动服务。
 
@@ -62,9 +65,9 @@ curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/depl
 
 ```bash
 sudo bash deploy.sh \
-  --web-domain sub.your-domain.com \
-  --management-domain panel.your-domain.com \
-  --cert-email admin@your-domain.com
+  --web-domain sub.你的真实域名.com \
+  --management-domain panel.你的真实域名.com \
+  --cert-email admin@你的真实域名.com
 ```
 
 可选参数：

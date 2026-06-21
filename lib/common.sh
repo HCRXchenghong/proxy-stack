@@ -41,7 +41,7 @@ is_placeholder_domain() {
   local domain
   domain="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$domain" in
-    example.com|*.example.com|example.net|*.example.net|example.org|*.example.org|localhost|*.localhost|invalid|*.invalid|test|*.test)
+    example.com|*.example.com|example.net|*.example.net|example.org|*.example.org|your-domain.com|*.your-domain.com|your-real-domain.com|*.your-real-domain.com|localhost|*.localhost|invalid|*.invalid|test|*.test)
       return 0
       ;;
   esac
