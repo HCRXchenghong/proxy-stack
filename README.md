@@ -6,7 +6,7 @@ Ubuntu 一键部署 VLESS + REALITY + Vision、Hysteria2、短链接交付页、
 
 - VLESS + REALITY + Vision：TCP 443，经 nginx stream 按 SNI 分流到 Xray。
 - Hysteria2：UDP 443，使用 TLS 证书和 salamander obfs。
-- 用户短链接页：`https://你的域名/u/<slug>`。
+- 用户交付页：`https://你的域名/web/<slug>`。
 - 订阅输出：通用 base64 URI、原始 URI、Mihomo/Clash Meta YAML。
 - 自动申请 Let's Encrypt 证书，并配置续期后的服务重载。
 - 部署完成后自动验证服务，并进入中文管理菜单；后续输入 `seroncheng` 即可唤起菜单。
@@ -27,7 +27,7 @@ Ubuntu 一键部署 VLESS + REALITY + Vision、Hysteria2、短链接交付页、
 
 需要两个域名：
 
-- `WEB_DOMAIN`：用户短链接页和订阅域名，例如 `sub.example.com`。
+- `WEB_DOMAIN`：用户交付页和订阅域名，例如 `node.example.com`。
 - `MANAGEMENT_DOMAIN`：管理域名，会被 nginx 转发到本机 `127.0.0.1:8317`。如果暂时不用管理面板，也建议准备一个独立子域名用于证书和 SNI 分流。
 
 ## 一键部署
@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/depl
 
 脚本会用中文提示依次输入：
 
-- 用户交付页/订阅域名，例如 `sub.你的真实域名.com`。
+- 用户交付页/订阅域名，例如 `node.你的真实域名.com`。
 - 管理域名，例如 `panel.你的真实域名.com`。
 - Let's Encrypt 真实邮箱。
 
@@ -49,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/depl
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/deploy.sh \
   | sudo bash -s -- \
-    --web-domain sub.你的真实域名.com \
+    --web-domain node.你的真实域名.com \
     --management-domain panel.你的真实域名.com \
     --cert-email admin@你的真实域名.com
 ```
@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/depl
 
 ```bash
 sudo bash deploy.sh \
-  --web-domain sub.你的真实域名.com \
+  --web-domain node.你的真实域名.com \
   --management-domain panel.你的真实域名.com \
   --cert-email admin@你的真实域名.com
 ```
@@ -113,7 +113,7 @@ sudo bash /root/proxy-stack/proxy-stack.sh check-update
 sudo bash /root/proxy-stack/proxy-stack.sh update
 ```
 
-当前正式版本：`1.0.0`。版本检测规则为：优先读取 GitHub 最新 Release；如果没有 Release，则读取最新 Tag。菜单中的 `14) 查更新` 和 `15) 更新` 与上面两个命令一致。
+当前正式版本：`1.0.1`。版本检测规则为：优先读取 GitHub 最新 Release；如果没有 Release，则读取最新 Tag。菜单中的 `14) 查更新` 和 `15) 更新` 与上面两个命令一致。
 
 主要运行文件：
 
@@ -137,13 +137,13 @@ sudo bash /root/proxy-stack/proxy-stack.sh update
 sudo bash /root/proxy-stack/proxy-stack.sh user add alice
 ```
 
-输出里会包含：
+输出里会包含中文字段：
 
-- `PAGE`：用户交付页。
-- `SUB`：通用订阅，适合 v2rayN、v2rayNG、V2Box、Shadowrocket 等 URI 客户端。
-- `CLASH`：Mihomo/Clash Meta YAML 订阅。
-- `RAW`：未 base64 的原始 URI。
-- `VLESS` / `HY2`：单节点链接。
+- 交付页面：用户打开后可复制各类链接。
+- 通用订阅：适合 v2rayN、v2rayNG、V2Box、Shadowrocket 等 URI 客户端。
+- Mihomo配置：适合 Mihomo / Clash Meta。
+- 原始节点：未 base64 的 VLESS 和 Hysteria2 原始节点。
+- VLESS链接 / Hysteria2链接：单节点链接。
 
 常用命令：
 
@@ -190,10 +190,10 @@ sudo certbot renew --dry-run
 假设新增用户后 slug 为 `AbCd123456`：
 
 ```text
-https://sub.example.com/u/AbCd123456       用户交付页
-https://sub.example.com/sub/AbCd123456     通用 base64 URI 订阅
-https://sub.example.com/raw/AbCd123456     原始 URI
-https://sub.example.com/clash/AbCd123456   Mihomo/Clash Meta YAML
+https://node.example.com/web/AbCd123456      用户交付页
+https://node.example.com/link/AbCd123456     通用 base64 URI 订阅
+https://node.example.com/mihomo/AbCd123456   Mihomo/Clash Meta YAML
+https://node.example.com/node/AbCd123456     原始节点 URI
 ```
 
 ## 端口和分流

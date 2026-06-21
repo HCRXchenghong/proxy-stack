@@ -114,54 +114,199 @@ rules:
 def render_html(env: dict, user: dict):
     vless, hy2 = raw_links(env, user)
     slug = user["slug"]
-    sub_url = f"https://{env['WEB_DOMAIN']}/sub/{slug}"
-    clash_url = f"https://{env['WEB_DOMAIN']}/clash/{slug}"
-    raw_url = f"https://{env['WEB_DOMAIN']}/raw/{slug}"
+    page_url = f"https://{env['WEB_DOMAIN']}/web/{slug}"
+    link_url = f"https://{env['WEB_DOMAIN']}/link/{slug}"
+    mihomo_url = f"https://{env['WEB_DOMAIN']}/mihomo/{slug}"
+    node_url = f"https://{env['WEB_DOMAIN']}/node/{slug}"
+    safe_name = html.escape(user["name"])
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(user['name'])} - Proxy Stack</title>
+  <title>{safe_name} - 节点交付</title>
   <style>
-    body {{ font-family: -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif; margin: 0; background: #0b1220; color: #e5eefc; }}
-    main {{ max-width: 880px; margin: 0 auto; padding: 32px 20px 48px; }}
-    h1 {{ margin: 0 0 8px; font-size: 28px; }}
-    p {{ color: #a9bddf; line-height: 1.6; }}
-    .grid {{ display: grid; gap: 16px; margin-top: 24px; }}
-    .card {{ background: #131d31; border: 1px solid #20304d; border-radius: 10px; padding: 18px; }}
-    .label {{ font-size: 13px; color: #8ba5d3; margin-bottom: 8px; }}
-    code {{ display: block; white-space: pre-wrap; word-break: break-all; background: #0a1324; border-radius: 8px; padding: 12px; color: #d8e6ff; }}
-    a {{ color: #7cc5ff; }}
+    :root {{
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #657085;
+      --line: #dbe2ec;
+      --soft: #eef3f7;
+      --accent: #0f766e;
+      --accent-2: #334155;
+      --code: #111827;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }}
+    main {{ max-width: 980px; margin: 0 auto; padding: 28px 18px 42px; }}
+    header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      padding: 22px 0 18px;
+      border-bottom: 1px solid var(--line);
+    }}
+    h1 {{ margin: 0; font-size: 30px; line-height: 1.18; letter-spacing: 0; }}
+    h2 {{ margin: 28px 0 12px; font-size: 18px; letter-spacing: 0; }}
+    .meta {{ margin-top: 8px; color: var(--muted); font-size: 14px; word-break: break-all; }}
+    .badge {{
+      flex: 0 0 auto;
+      border: 1px solid #b7d7d2;
+      background: #e7f5f2;
+      color: #0f5f59;
+      border-radius: 999px;
+      padding: 7px 11px;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    .grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }}
+    .stack {{ display: grid; gap: 12px; }}
+    .card {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 10px 28px rgba(23, 32, 51, 0.06);
+    }}
+    .card-title {{ margin: 0 0 10px; font-size: 15px; font-weight: 800; }}
+    .url {{
+      display: block;
+      min-height: 46px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      background: var(--soft);
+      border: 1px solid #e3e9f2;
+      border-radius: 8px;
+      padding: 11px;
+      color: var(--code);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .actions {{ display: flex; gap: 8px; margin-top: 12px; }}
+    button, a.button {{
+      appearance: none;
+      border: 1px solid var(--line);
+      background: #ffffff;
+      color: var(--accent-2);
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 14px;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+    }}
+    button.primary, a.primary {{ background: var(--accent); border-color: var(--accent); color: #ffffff; }}
+    .wide {{ grid-column: 1 / -1; }}
+    .toast {{
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translateX(-50%);
+      background: #172033;
+      color: #ffffff;
+      border-radius: 8px;
+      padding: 10px 14px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .18s ease;
+      font-size: 14px;
+    }}
+    .toast.show {{ opacity: 1; }}
+    @media (max-width: 760px) {{
+      main {{ padding: 18px 14px 32px; }}
+      header {{ display: block; }}
+      h1 {{ font-size: 26px; }}
+      .badge {{ display: inline-block; margin-top: 14px; }}
+      .grid {{ grid-template-columns: 1fr; }}
+      .actions {{ flex-wrap: wrap; }}
+      button, a.button {{ flex: 1 1 auto; text-align: center; }}
+    }}
   </style>
 </head>
 <body>
   <main>
-    <h1>{html.escape(user['name'])}</h1>
-    <p>给 URI 客户端使用通用订阅；给 Mihomo/Clash Meta 使用 Clash 订阅。原始链接也保留在下面，方便手动导入。</p>
+    <header>
+      <div>
+        <h1>{safe_name}</h1>
+        <div class="meta">交付页面：{html.escape(page_url)}</div>
+      </div>
+      <div class="badge">已启用</div>
+    </header>
+
+    <h2>订阅入口</h2>
     <div class="grid">
       <div class="card">
-        <div class="label">通用短订阅（v2rayN / v2rayNG / V2Box / Shadowrocket 可直接复制）</div>
-        <code>{html.escape(sub_url)}</code>
+        <div class="card-title">通用订阅</div>
+        <code class="url" id="link">{html.escape(link_url)}</code>
+        <div class="actions">
+          <button class="primary" data-copy="link">复制</button>
+          <a class="button" href="{html.escape(link_url)}">打开</a>
+        </div>
       </div>
       <div class="card">
-        <div class="label">Mihomo / Clash Meta 订阅</div>
-        <code>{html.escape(clash_url)}</code>
+        <div class="card-title">Mihomo 配置</div>
+        <code class="url" id="mihomo">{html.escape(mihomo_url)}</code>
+        <div class="actions">
+          <button class="primary" data-copy="mihomo">复制</button>
+          <a class="button" href="{html.escape(mihomo_url)}">打开</a>
+        </div>
       </div>
       <div class="card">
-        <div class="label">原始 URI 订阅</div>
-        <code>{html.escape(raw_url)}</code>
+        <div class="card-title">原始节点</div>
+        <code class="url" id="node">{html.escape(node_url)}</code>
+        <div class="actions">
+          <button class="primary" data-copy="node">复制</button>
+          <a class="button" href="{html.escape(node_url)}">打开</a>
+        </div>
       </div>
-      <div class="card">
-        <div class="label">VLESS + REALITY + Vision</div>
-        <code>{html.escape(vless)}</code>
+
+      <div class="card wide">
+        <div class="card-title">VLESS + REALITY + Vision</div>
+        <code class="url" id="vless">{html.escape(vless)}</code>
+        <div class="actions">
+          <button class="primary" data-copy="vless">复制</button>
+        </div>
       </div>
-      <div class="card">
-        <div class="label">Hysteria2</div>
-        <code>{html.escape(hy2)}</code>
+      <div class="card wide">
+        <div class="card-title">Hysteria2</div>
+        <code class="url" id="hy2">{html.escape(hy2)}</code>
+        <div class="actions">
+          <button class="primary" data-copy="hy2">复制</button>
+        </div>
       </div>
     </div>
   </main>
+  <div class="toast" id="toast">已复制</div>
+  <script>
+    const toast = document.getElementById('toast');
+    function showToast(text) {{
+      toast.textContent = text;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 1300);
+    }}
+    document.querySelectorAll('[data-copy]').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const target = document.getElementById(button.dataset.copy);
+        const text = target ? target.textContent.trim() : '';
+        try {{
+          await navigator.clipboard.writeText(text);
+          showToast('已复制');
+        }} catch (err) {{
+          showToast('复制失败，请手动选择');
+        }}
+      }});
+    }});
+  </script>
 </body>
 </html>"""
 
@@ -187,19 +332,19 @@ class App(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
-        if route == "sub":
+        if route == "link":
             body = "\n".join(raw_links(self.env, user)).encode()
             payload = base64.b64encode(body)
             self._send(HTTPStatus.OK, "text/plain; charset=utf-8", payload)
             return
-        if route == "raw":
+        if route == "node":
             body = ("\n".join(raw_links(self.env, user)) + "\n").encode()
             self._send(HTTPStatus.OK, "text/plain; charset=utf-8", body)
             return
-        if route == "clash":
+        if route == "mihomo":
             self._send(HTTPStatus.OK, "application/yaml; charset=utf-8", render_clash(self.env, user).encode())
             return
-        if route in {"u", "s"}:
+        if route == "web":
             self._send(HTTPStatus.OK, "text/html; charset=utf-8", render_html(self.env, user).encode())
             return
 

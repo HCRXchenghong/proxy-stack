@@ -490,7 +490,7 @@ read_menu_input() {
 pause_menu() {
   local _
   has_interactive_tty || return 0
-  read_menu_input _ "回车继续..."
+  read_menu_input _ "按回车继续..."
 }
 
 run_menu_command() {
@@ -859,14 +859,14 @@ hy2 = (
 if obfs:
     hy2 += f'&obfs=salamander&obfs-password={quote(obfs)}'
 hy2 += f'#{quote(u["name"] + "-hy2")}'
-print(f'NAME={u["name"]}')
-print(f'SLUG={u["slug"]}')
-print(f'PAGE=https://{domain}/u/{u["slug"]}')
-print(f'SUB=https://{domain}/sub/{u["slug"]}')
-print(f'CLASH=https://{domain}/clash/{u["slug"]}')
-print(f'RAW=https://{domain}/raw/{u["slug"]}')
-print(f'VLESS={vless}')
-print(f'HY2={hy2}')
+print(f'用户名：{u["name"]}')
+print(f'短码：{u["slug"]}')
+print(f'交付页面：https://{domain}/web/{u["slug"]}')
+print(f'通用订阅：https://{domain}/link/{u["slug"]}')
+print(f'Mihomo配置：https://{domain}/mihomo/{u["slug"]}')
+print(f'原始节点：https://{domain}/node/{u["slug"]}')
+print(f'VLESS链接：{vless}')
+print(f'Hysteria2链接：{hy2}')
 PY
 }
 
@@ -903,10 +903,10 @@ if obfs:
     hy2 += f'&obfs=salamander&obfs-password={quote(obfs)}'
 hy2 += f'#{quote(u["name"] + "-hy2")}'
 print(f"""[{u['name']}]
-页面: https://{domain}/u/{u['slug']}
-通用订阅: https://{domain}/sub/{u['slug']}
-Clash/Mihomo: https://{domain}/clash/{u['slug']}
-原始URI订阅: https://{domain}/raw/{u['slug']}
+交付页面: https://{domain}/web/{u['slug']}
+通用订阅: https://{domain}/link/{u['slug']}
+Mihomo配置: https://{domain}/mihomo/{u['slug']}
+原始节点: https://{domain}/node/{u['slug']}
 
 VLESS:
 {vless}
@@ -968,10 +968,10 @@ for u in users:
         "name": u["name"],
         "slug": u["slug"],
         "enabled": bool(u.get("enabled", True)),
-        "page": f'https://{domain}/u/{u["slug"]}',
-        "sub": f'https://{domain}/sub/{u["slug"]}',
-        "clash": f'https://{domain}/clash/{u["slug"]}',
-        "raw": f'https://{domain}/raw/{u["slug"]}',
+        "web": f'https://{domain}/web/{u["slug"]}',
+        "link": f'https://{domain}/link/{u["slug"]}',
+        "mihomo": f'https://{domain}/mihomo/{u["slug"]}',
+        "node": f'https://{domain}/node/{u["slug"]}',
         "vless": vless,
         "hy2": hy2,
     })
@@ -981,7 +981,7 @@ if fmt == "json":
     out_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
 elif fmt == "csv":
     with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "slug", "enabled", "page", "sub", "clash", "raw", "vless", "hy2"])
+        writer = csv.DictWriter(f, fieldnames=["name", "slug", "enabled", "web", "link", "mihomo", "node", "vless", "hy2"])
         writer.writeheader()
         writer.writerows(rows)
 else:
@@ -990,12 +990,12 @@ else:
             f.write(
                 f"[{row['name']}]\n"
                 f"状态: {'启用' if row['enabled'] else '禁用'}\n"
-                f"页面: {row['page']}\n"
-                f"通用订阅: {row['sub']}\n"
-                f"Clash/Mihomo: {row['clash']}\n"
-                f"原始URI订阅: {row['raw']}\n"
-                f"VLESS: {row['vless']}\n"
-                f"HY2: {row['hy2']}\n\n"
+                f"交付页面: {row['web']}\n"
+                f"通用订阅: {row['link']}\n"
+                f"Mihomo配置: {row['mihomo']}\n"
+                f"原始节点: {row['node']}\n"
+                f"VLESS链接: {row['vless']}\n"
+                f"Hysteria2链接: {row['hy2']}\n\n"
             )
 print(out_path)
 PY
