@@ -9,6 +9,7 @@ Ubuntu 一键部署 VLESS + REALITY + Vision、Hysteria2、短链接交付页、
 - 用户短链接页：`https://你的域名/u/<slug>`。
 - 订阅输出：通用 base64 URI、原始 URI、Mihomo/Clash Meta YAML。
 - 自动申请 Let's Encrypt 证书，并配置续期后的服务重载。
+- 部署完成后自动验证服务，并进入中文管理菜单；后续输入 `seroncheng` 即可唤起菜单。
 - 用户管理：新增、批量新增、禁用、启用、删除、导出。
 
 ## 系统要求
@@ -59,7 +60,7 @@ curl -fsSL https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/depl
 
 脚本的交互提示、错误提示和帮助信息均为中文。使用 `curl | sudo bash` 管道安装时，省略参数也会从当前终端提示输入；如果是在完全非交互环境中运行，请显式传入 `--web-domain`、`--management-domain` 和 `--cert-email`。
 
-脚本会把项目下载到 `/root/proxy-stack`，安装依赖，下载 Xray 和 Hysteria2，申请证书，写入 nginx/systemd 配置并启动服务。
+脚本会把项目下载到 `/root/proxy-stack`，安装依赖，下载 Xray 和 Hysteria2，申请证书，写入 nginx/systemd 配置并启动服务。部署完成后会自动验证服务状态，并在交互式终端中进入中文管理菜单。
 
 也可以先克隆/上传项目后本地部署：
 
@@ -85,9 +86,17 @@ sudo bash deploy.sh \
 
 ## 安装后验证
 
+部署脚本会自动执行验证。后续也可以手动执行：
+
 ```bash
 sudo bash /root/proxy-stack/proxy-stack.sh verify
 systemctl status proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
+```
+
+打开管理菜单：
+
+```bash
+seroncheng
 ```
 
 主要运行文件：
@@ -100,6 +109,7 @@ systemctl status proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
 /etc/nginx/conf.d/proxy-stack-*.conf
 /etc/nginx/stream-conf.d/proxy-stack-stream.conf
 /etc/systemd/system/proxy-stack-*.service
+/usr/local/bin/seroncheng         中文管理菜单入口
 ```
 
 ## 用户管理
@@ -138,6 +148,23 @@ sudo bash /root/proxy-stack/proxy-stack.sh user export csv /root/proxy-stack-use
 ```bash
 sudo bash /root/proxy-stack/proxy-stack.sh render
 sudo systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
+```
+
+也可以直接输入 `seroncheng`，在菜单里完成新增用户、批量新增、启用/禁用、删除、导出、验证服务、查看 SSL 状态和续签测试。
+
+## SSL 自动续签
+
+脚本使用系统 Certbot 自动续签机制，并显式启用 `certbot.timer`。证书续签成功后会执行：
+
+```text
+/etc/letsencrypt/renewal-hooks/deploy/proxy-stack-reload.sh
+```
+
+该 hook 会 reload nginx，并重启 Xray、Hysteria2 和交付页服务，让新证书自动生效。可在菜单中查看 SSL 状态或执行续签测试，也可以手动检查：
+
+```bash
+systemctl status certbot.timer --no-pager
+sudo certbot renew --dry-run
 ```
 
 ## 订阅地址格式

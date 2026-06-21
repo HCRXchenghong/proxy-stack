@@ -278,8 +278,7 @@ main() {
   run_install
 
   log "部署完成"
-  log "添加用户：bash $INSTALL_DIR/proxy-stack.sh user add <name>"
-  log "验证服务：bash $INSTALL_DIR/proxy-stack.sh verify"
+  log "已自动执行验证；后续管理请输入：seroncheng"
 }
 
 main "$@"

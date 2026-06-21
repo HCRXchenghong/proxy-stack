@@ -22,6 +22,7 @@ usage() {
   ./proxy-stack.sh user show <用户名或slug>
   ./proxy-stack.sh user share <用户名或slug>
   ./proxy-stack.sh user export [csv|json|text] [路径]
+  ./proxy-stack.sh menu
   ./proxy-stack.sh uninstall-3xui
   ./proxy-stack.sh package
 
@@ -183,11 +184,16 @@ install_stack() {
   disable_legacy_hcrx_conf
   load_env
   issue_cert_if_needed "$TLS_CERT_FILE" "$TLS_KEY_FILE" "$CERT_EMAIL" "$WEB_DOMAIN" "$MANAGEMENT_DOMAIN"
-  write_certbot_hook
+  ensure_certbot_auto_renewal
   render_stack
   systemctl enable --now proxy-stack-xray proxy-stack-hysteria proxy-stack-web
   reload_nginx
+  wait_stack_ready
+  verify_stack
+  write_runtime_info
+  install_launcher
   log "安装完成"
+  start_menu_if_interactive
 }
 
 render_stack() {
@@ -246,8 +252,218 @@ write_runtime_info() {
     printf '管理域名：%s\n' "$MANAGEMENT_DOMAIN"
     printf '公网 IP：%s\n' "$PUBLIC_IP"
     printf '用户列表命令：bash /root/proxy-stack/proxy-stack.sh user list\n'
+    printf '管理菜单命令：seroncheng\n'
   } >"$info_file"
   chmod 600 "$info_file"
+}
+
+ensure_certbot_auto_renewal() {
+  write_certbot_hook
+  if systemctl list-unit-files certbot.timer >/dev/null 2>&1; then
+    systemctl enable --now certbot.timer
+    log "已启用 Let's Encrypt 自动续签定时器 certbot.timer"
+  else
+    log "未找到 certbot.timer；Certbot 可能使用系统自带调度方式续签"
+  fi
+}
+
+install_launcher() {
+  local launcher="/usr/local/bin/seroncheng"
+  cat >"$launcher" <<EOF
+#!/usr/bin/env bash
+exec bash "${SCRIPT_DIR}/proxy-stack.sh" menu "\$@"
+EOF
+  chmod 0755 "$launcher"
+  log "已安装管理入口：seroncheng"
+}
+
+has_interactive_tty() {
+  [[ -r /dev/tty && -w /dev/tty ]] || [[ -t 0 ]]
+}
+
+read_menu_input() {
+  local var_name="$1"
+  local prompt="$2"
+  local value
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s' "$prompt" >/dev/tty
+    IFS= read -r value </dev/tty
+  else
+    read -r -p "$prompt" value
+  fi
+  printf -v "$var_name" '%s' "$value"
+}
+
+pause_menu() {
+  local _
+  has_interactive_tty || return 0
+  read_menu_input _ "按回车返回菜单..."
+}
+
+run_menu_command() {
+  set +e
+  "$@"
+  local status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    log "操作失败，退出码：$status"
+  fi
+  return 0
+}
+
+menu_header() {
+  load_env
+  cat <<EOF
+
+================ SeronCheng Proxy Stack 管理菜单 ================
+用户域名：${WEB_DOMAIN}
+管理域名：${MANAGEMENT_DOMAIN}
+公网 IP：${PUBLIC_IP}
+后续可在命令行输入：seroncheng
+================================================================
+EOF
+}
+
+show_cert_status() {
+  load_env
+  printf '\n[证书状态]\n'
+  if command -v certbot >/dev/null 2>&1; then
+    certbot certificates --cert-name "$WEB_DOMAIN" || certbot certificates || true
+  else
+    log "未找到 certbot 命令"
+  fi
+  printf '\n[自动续签定时器]\n'
+  systemctl status certbot.timer --no-pager || true
+  printf '\n[续签后重载 hook]\n'
+  if [[ -x /etc/letsencrypt/renewal-hooks/deploy/proxy-stack-reload.sh ]]; then
+    printf '已安装：/etc/letsencrypt/renewal-hooks/deploy/proxy-stack-reload.sh\n'
+  else
+    printf '未安装，正在补写...\n'
+    write_certbot_hook
+  fi
+}
+
+run_certbot_dry_run() {
+  ensure_certbot_auto_renewal
+  certbot renew --dry-run
+}
+
+menu_loop() {
+  require_root
+  has_interactive_tty || {
+    log "当前不是交互式终端，无法打开菜单；请在服务器命令行输入 seroncheng"
+    return 0
+  }
+
+  local choice name prefix count start key format out_path confirm
+  while true; do
+    menu_header
+    cat <<'EOF'
+1) 验证部署
+2) 查看服务状态
+3) 添加用户
+4) 批量添加用户
+5) 用户列表
+6) 查看/分享用户链接
+7) 禁用用户
+8) 启用用户
+9) 删除用户
+10) 导出用户
+11) 重新渲染配置并重启服务
+12) 查看 SSL 证书和自动续签状态
+13) 执行 SSL 自动续签测试（dry-run）
+0) 退出
+EOF
+    read_menu_input choice "请选择操作："
+    case "$choice" in
+      1)
+        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" verify
+        pause_menu
+        ;;
+      2)
+        run_menu_command systemctl status proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx certbot.timer --no-pager
+        pause_menu
+        ;;
+      3)
+        read_menu_input name "请输入用户名："
+        [[ -n "$name" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user add "$name"
+        pause_menu
+        ;;
+      4)
+        read_menu_input prefix "请输入用户名前缀："
+        read_menu_input count "请输入数量："
+        read_menu_input start "请输入起始序号（默认 1）："
+        start="${start:-1}"
+        [[ -n "$prefix" && -n "$count" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user batch-add "$prefix" "$count" "$start"
+        pause_menu
+        ;;
+      5)
+        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user list
+        pause_menu
+        ;;
+      6)
+        read_menu_input key "请输入用户名或 slug："
+        [[ -n "$key" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user share "$key"
+        pause_menu
+        ;;
+      7)
+        read_menu_input key "请输入要禁用的用户名或 slug："
+        [[ -n "$key" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user disable "$key"
+        pause_menu
+        ;;
+      8)
+        read_menu_input key "请输入要启用的用户名或 slug："
+        [[ -n "$key" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user enable "$key"
+        pause_menu
+        ;;
+      9)
+        read_menu_input key "请输入要删除的用户名或 slug："
+        if [[ -n "$key" ]]; then
+          read_menu_input confirm "确认删除 ${key}？输入 yes 确认："
+          [[ "$confirm" == "yes" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user del "$key"
+        fi
+        pause_menu
+        ;;
+      10)
+        read_menu_input format "导出格式 csv/json/text（默认 csv）："
+        format="${format:-csv}"
+        read_menu_input out_path "导出路径（留空使用默认路径）："
+        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user export "$format" "$out_path"
+        pause_menu
+        ;;
+      11)
+        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" render
+        run_menu_command systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
+        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" verify
+        pause_menu
+        ;;
+      12)
+        run_menu_command show_cert_status
+        pause_menu
+        ;;
+      13)
+        run_menu_command run_certbot_dry_run
+        pause_menu
+        ;;
+      0|q|Q)
+        log "已退出管理菜单。后续输入 seroncheng 可再次打开。"
+        return 0
+        ;;
+      *)
+        log "未知选项：$choice"
+        pause_menu
+        ;;
+    esac
+  done
+}
+
+start_menu_if_interactive() {
+  if has_interactive_tty; then
+    log "验证完成，正在进入管理菜单。后续输入 seroncheng 可再次打开。"
+    menu_loop
+  else
+    log "验证完成。后续可输入 seroncheng 打开管理菜单。"
+  fi
 }
 
 user_add() {
@@ -595,6 +811,7 @@ case "$cmd" in
   install) shift; install_stack "$@" ;;
   render) render_stack ;;
   verify) verify_stack ;;
+  menu) menu_loop ;;
   user)
     sub="${2:-}"
     case "$sub" in
