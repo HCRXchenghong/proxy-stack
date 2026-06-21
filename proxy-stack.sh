@@ -74,6 +74,11 @@ download_hysteria() {
   log "已安装 Hysteria ${tag}"
 }
 
+install_system_packages() {
+  quiet_cmd "更新系统软件源" apt-get update
+  quiet_cmd "安装系统依赖" env DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip nginx libnginx-mod-stream certbot python3-certbot-nginx python3
+}
+
 issue_cert_if_needed() {
   local cert="$1" key="$2" email="$3" web_domain="$4" mgmt_domain="$5"
   if [[ -f "$cert" && -f "$key" ]]; then
@@ -186,13 +191,12 @@ install_stack() {
   if [[ "$using_existing_tls" -eq 0 ]]; then
     preflight_acme_dns "$public_ip" "$web_domain" "$mgmt_domain"
   fi
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip nginx libnginx-mod-stream certbot python3-certbot-nginx python3
+  progress_step 1 10 "安装依赖" install_system_packages
   require_cmd jq unzip nginx certbot
-  ensure_nginx_stream_include
-  systemctl enable --now nginx
-  download_xray
-  download_hysteria
+  progress_step 2 10 "配置 nginx" ensure_nginx_stream_include
+  progress_step 3 10 "启动 nginx" systemctl enable --now nginx
+  progress_step 4 10 "安装 Xray" download_xray
+  progress_step 5 10 "安装 Hysteria2" download_hysteria
   [[ -n "$reality_target" ]] || reality_target="www.amazon.com:443"
   [[ -n "$reality_sni" ]] || reality_sni="www.amazon.com"
   if [[ -z "$tls_cert" || -z "$tls_key" ]]; then
@@ -203,13 +207,12 @@ install_stack() {
   write_users_json
   disable_legacy_hcrx_conf
   load_env
-  issue_cert_if_needed "$TLS_CERT_FILE" "$TLS_KEY_FILE" "$CERT_EMAIL" "$WEB_DOMAIN" "$MANAGEMENT_DOMAIN"
-  ensure_certbot_auto_renewal
-  render_stack
-  systemctl enable --now proxy-stack-xray proxy-stack-hysteria proxy-stack-web
+  progress_step 6 10 "申请 SSL" issue_cert_if_needed "$TLS_CERT_FILE" "$TLS_KEY_FILE" "$CERT_EMAIL" "$WEB_DOMAIN" "$MANAGEMENT_DOMAIN"
+  progress_step 7 10 "启用续签" ensure_certbot_auto_renewal
+  progress_step 8 10 "生成配置" render_stack
+  progress_step 9 10 "启动服务" systemctl enable --now proxy-stack-xray proxy-stack-hysteria proxy-stack-web
   reload_nginx
-  wait_stack_ready
-  verify_stack
+  progress_step 10 10 "验证服务" verify_stack
   write_runtime_info
   install_launcher
   log "安装完成"
@@ -230,13 +233,13 @@ render_stack() {
 verify_stack() {
   require_root
   load_env
-  "${BIN_DIR}/xray" run -test -c "${STATE_DIR}/xray.json"
-  curl -fsS "http://127.0.0.1:${APP_PORT}/healthz" >/dev/null
-  nginx -t
-  systemctl is-active --quiet proxy-stack-xray
-  systemctl is-active --quiet proxy-stack-hysteria
-  systemctl is-active --quiet proxy-stack-web
-  systemctl is-active --quiet nginx
+  quiet_cmd "检测 Xray 配置" "${BIN_DIR}/xray" run -test -c "${STATE_DIR}/xray.json"
+  quiet_cmd "检测 Web 服务" curl -fsS "http://127.0.0.1:${APP_PORT}/healthz"
+  quiet_cmd "检测 nginx 配置" nginx -t
+  quiet_cmd "检查 Xray 服务" systemctl is-active --quiet proxy-stack-xray
+  quiet_cmd "检查 Hysteria2 服务" systemctl is-active --quiet proxy-stack-hysteria
+  quiet_cmd "检查 Web 服务状态" systemctl is-active --quiet proxy-stack-web
+  quiet_cmd "检查 nginx 服务" systemctl is-active --quiet nginx
   log "验证通过"
 }
 
@@ -256,7 +259,7 @@ wait_stack_ready() {
 }
 
 reload_stack_services() {
-  systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web
+  quiet_cmd "重启代理服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web
   wait_stack_ready
 }
 
@@ -280,7 +283,7 @@ write_runtime_info() {
 ensure_certbot_auto_renewal() {
   write_certbot_hook
   if systemctl list-unit-files certbot.timer >/dev/null 2>&1; then
-    systemctl enable --now certbot.timer
+    quiet_cmd "启用 certbot.timer" systemctl enable --now certbot.timer
     log "已启用 Let's Encrypt 自动续签定时器 certbot.timer"
   else
     log "未找到 certbot.timer；Certbot 可能使用系统自带调度方式续签"
@@ -303,23 +306,55 @@ normalize_project_repo_url() {
   printf '%s\n' "$repo"
 }
 
-project_raw_url() {
-  local path="$1"
+github_project_parts() {
   local repo owner name
   repo="$(normalize_project_repo_url)"
   if [[ "$repo" =~ ^https://github.com/([^/]+)/([^/]+)$ ]]; then
     owner="${BASH_REMATCH[1]}"
     name="${BASH_REMATCH[2]}"
-    printf 'https://raw.githubusercontent.com/%s/%s/%s/%s\n' "$owner" "$name" "$PROJECT_BRANCH" "$path"
+    printf '%s %s\n' "$owner" "$name"
   else
-    printf '%s/raw/%s/%s\n' "$repo" "$PROJECT_BRANCH" "$path"
+    die "版本检测/更新仅支持 GitHub 仓库地址：$repo"
   fi
 }
 
-project_tarball_url() {
-  local repo
-  repo="$(normalize_project_repo_url)"
-  printf '%s/archive/refs/heads/%s.tar.gz\n' "$repo" "$PROJECT_BRANCH"
+github_api_get() {
+  local url="$1"
+  curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "$url"
+}
+
+version_from_ref() {
+  local ref="$1"
+  ref="${ref#refs/tags/}"
+  ref="${ref#v}"
+  ref="${ref#V}"
+  printf '%s\n' "$ref"
+}
+
+remote_project_info() {
+  require_cmd curl python3
+  local owner name release_json tags_json tag tarball version
+  read -r owner name < <(github_project_parts)
+
+  if release_json="$(github_api_get "https://api.github.com/repos/${owner}/${name}/releases/latest" 2>/dev/null)"; then
+    read -r tag tarball < <(printf '%s' "$release_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print((data.get("tag_name") or "") + "\t" + (data.get("tarball_url") or ""))')
+    if [[ -n "$tag" ]]; then
+      version="$(version_from_ref "$tag")"
+      [[ -n "$tarball" ]] || tarball="https://github.com/${owner}/${name}/archive/refs/tags/${tag}.tar.gz"
+      printf 'release %s %s %s\n' "$version" "$tag" "$tarball"
+      return 0
+    fi
+  fi
+
+  tags_json="$(github_api_get "https://api.github.com/repos/${owner}/${name}/tags?per_page=1")" || return 1
+  read -r tag tarball < <(printf '%s' "$tags_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); item=data[0] if isinstance(data, list) and data else {}; print((item.get("name") or "") + "\t" + (item.get("tarball_url") or ""))')
+  [[ -n "$tag" ]] || return 1
+  version="$(version_from_ref "$tag")"
+  [[ -n "$tarball" ]] || tarball="https://github.com/${owner}/${name}/archive/refs/tags/${tag}.tar.gz"
+  printf 'tag %s %s %s\n' "$version" "$tag" "$tarball"
 }
 
 local_project_version() {
@@ -330,10 +365,12 @@ local_project_version() {
   fi
 }
 
-remote_project_version() {
-  local url
-  url="$(project_raw_url VERSION)"
-  curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 "$url" | head -n 1 | tr -d '[:space:]'
+remote_source_label() {
+  case "$1" in
+    release) printf 'GitHub Release' ;;
+    tag) printf 'Git Tag' ;;
+    *) printf '%s' "$1" ;;
+  esac
 }
 
 compare_project_versions() {
@@ -368,19 +405,20 @@ PY
 
 check_project_update() {
   require_cmd curl python3
-  local local_version remote_version compare_result
+  local local_version remote_source remote_version remote_ref remote_tarball compare_result
   local_version="$(local_project_version)"
-  remote_version="$(remote_project_version)" || die "检测远程版本失败，请检查网络或仓库地址"
-  [[ -n "$remote_version" ]] || die "远程 VERSION 为空，无法检测更新"
+  read -r remote_source remote_version remote_ref remote_tarball < <(remote_project_info) || die "检测远程版本失败，请检查网络或仓库地址"
+  [[ -n "$remote_version" ]] || die "远程版本为空，无法检测更新"
   printf '当前版本：%s\n' "$local_version"
-  printf '远程版本：%s\n' "$remote_version"
+  printf '最新版本：%s\n' "$remote_version"
+  printf '版本来源：%s（%s）\n' "$(remote_source_label "$remote_source")" "$remote_ref"
   compare_result="$(compare_project_versions "$local_version" "$remote_version")"
   if [[ "$compare_result" == "0" ]]; then
     log "当前已是最新版本"
     return 0
   fi
   if [[ "$compare_result" == "1" ]]; then
-    log "本地版本高于远程 VERSION，可能是 GitHub raw 缓存尚未刷新"
+    log "本地版本高于远程版本，暂不更新"
     return 0
   fi
   log "发现可用更新：${local_version} -> ${remote_version}"
@@ -389,10 +427,11 @@ check_project_update() {
 
 download_project_payload() {
   local dst="$1"
+  local tarball_url="$2"
   local tmp archive src
   tmp="$(mktemp -d)"
   archive="$tmp/proxy-stack.tar.gz"
-  curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$(project_tarball_url)" -o "$archive"
+  curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$tarball_url" -o "$archive"
   tar -xzf "$archive" -C "$tmp"
   src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   [[ -n "$src" ]] || die "解压更新包失败"
@@ -406,10 +445,10 @@ download_project_payload() {
 update_project() {
   require_root
   require_cmd curl tar systemctl python3
-  local local_version remote_version compare_result
+  local local_version remote_source remote_version remote_ref remote_tarball compare_result
   local_version="$(local_project_version)"
-  remote_version="$(remote_project_version)" || die "检测远程版本失败，请检查网络或仓库地址"
-  [[ -n "$remote_version" ]] || die "远程 VERSION 为空，无法更新"
+  read -r remote_source remote_version remote_ref remote_tarball < <(remote_project_info) || die "检测远程版本失败，请检查网络或仓库地址"
+  [[ -n "$remote_version" && -n "$remote_tarball" ]] || die "远程版本信息不完整，无法更新"
   compare_result="$(compare_project_versions "$local_version" "$remote_version")"
 
   if [[ "$compare_result" == "0" ]]; then
@@ -417,17 +456,17 @@ update_project() {
     return 0
   fi
   if [[ "$compare_result" == "1" ]]; then
-    log "本地版本 $local_version 高于远程 VERSION $remote_version，暂不更新。请稍后再试。"
+    log "本地版本 $local_version 高于远程版本 $remote_version，暂不更新。"
     return 0
   fi
 
-  log "开始更新 Proxy Stack：${local_version} -> ${remote_version}"
-  download_project_payload "$SCRIPT_DIR"
-  install_launcher
-  ensure_certbot_auto_renewal
-  bash "$SCRIPT_DIR/proxy-stack.sh" render
-  systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
-  bash "$SCRIPT_DIR/proxy-stack.sh" verify
+  log "开始更新：${local_version} -> ${remote_version}（$(remote_source_label "$remote_source")：${remote_ref}）"
+  progress_step 1 6 "下载更新" download_project_payload "$SCRIPT_DIR" "$remote_tarball"
+  progress_step 2 6 "更新入口" install_launcher
+  progress_step 3 6 "续签配置" ensure_certbot_auto_renewal
+  progress_step 4 6 "生成配置" bash "$SCRIPT_DIR/proxy-stack.sh" render
+  progress_step 5 6 "重启服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
+  progress_step 6 6 "验证服务" bash "$SCRIPT_DIR/proxy-stack.sh" verify
   log "更新完成，当前版本：${remote_version}"
 }
 
@@ -451,7 +490,7 @@ read_menu_input() {
 pause_menu() {
   local _
   has_interactive_tty || return 0
-  read_menu_input _ "按回车返回菜单..."
+  read_menu_input _ "回车继续..."
 }
 
 run_menu_command() {
@@ -469,38 +508,52 @@ menu_header() {
   load_env
   cat <<EOF
 
-================ SeronCheng Proxy Stack 管理菜单 ================
-用户域名：${WEB_DOMAIN}
-管理域名：${MANAGEMENT_DOMAIN}
-公网 IP：${PUBLIC_IP}
-脚本版本：$(local_project_version)
-后续可在命令行输入：seroncheng
-================================================================
+========== SeronCheng ==========
+用户：${WEB_DOMAIN}
+管理：${MANAGEMENT_DOMAIN}
+IP：${PUBLIC_IP}
+版本：$(local_project_version)
+入口：seroncheng
+================================
 EOF
+}
+
+show_service_status() {
+  local unit active enabled
+  printf '\n%-28s %-10s %-10s\n' "服务" "状态" "自启"
+  for unit in proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx certbot.timer; do
+    active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    printf '%-28s %-10s %-10s\n' "$unit" "${active:-unknown}" "${enabled:-unknown}"
+  done
 }
 
 show_cert_status() {
   load_env
-  printf '\n[证书状态]\n'
-  if command -v certbot >/dev/null 2>&1; then
-    certbot certificates --cert-name "$WEB_DOMAIN" || certbot certificates || true
+  local subject expires timer_active timer_enabled
+  printf '\n证书：%s\n' "$TLS_CERT_FILE"
+  if [[ -f "$TLS_CERT_FILE" ]] && command -v openssl >/dev/null 2>&1; then
+    subject="$(openssl x509 -in "$TLS_CERT_FILE" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+    expires="$(openssl x509 -in "$TLS_CERT_FILE" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+    printf '域名：%s\n' "${subject:-未知}"
+    printf '到期：%s\n' "${expires:-未知}"
   else
-    log "未找到 certbot 命令"
+    printf '状态：未找到证书文件或 openssl\n'
   fi
-  printf '\n[自动续签定时器]\n'
-  systemctl status certbot.timer --no-pager || true
-  printf '\n[续签后重载 hook]\n'
+  timer_active="$(systemctl is-active certbot.timer 2>/dev/null || true)"
+  timer_enabled="$(systemctl is-enabled certbot.timer 2>/dev/null || true)"
+  printf '续签：certbot.timer %s / %s\n' "${timer_active:-unknown}" "${timer_enabled:-unknown}"
   if [[ -x /etc/letsencrypt/renewal-hooks/deploy/proxy-stack-reload.sh ]]; then
-    printf '已安装：/etc/letsencrypt/renewal-hooks/deploy/proxy-stack-reload.sh\n'
+    printf 'Hook：已安装\n'
   else
-    printf '未安装，正在补写...\n'
+    printf 'Hook：未安装，正在补写\n'
     write_certbot_hook
   fi
 }
 
 run_certbot_dry_run() {
-  ensure_certbot_auto_renewal
-  certbot renew --dry-run
+  progress_step 1 2 "续签配置" ensure_certbot_auto_renewal
+  progress_step 2 2 "续签测试" certbot renew --dry-run
 }
 
 menu_loop() {
@@ -514,42 +567,42 @@ menu_loop() {
   while true; do
     menu_header
     cat <<'EOF'
-1) 验证部署
-2) 查看服务状态
-3) 添加用户
-4) 批量添加用户
-5) 用户列表
-6) 查看/分享用户链接
-7) 禁用用户
-8) 启用用户
-9) 删除用户
-10) 导出用户
-11) 重新渲染配置并重启服务
-12) 查看 SSL 证书和自动续签状态
-13) 执行 SSL 自动续签测试（dry-run）
-14) 检测脚本更新
-15) 一键更新脚本
+1) 验证
+2) 状态
+3) 加用户
+4) 批量加
+5) 用户
+6) 链接
+7) 禁用
+8) 启用
+9) 删除
+10) 导出
+11) 重载
+12) 证书
+13) 续签测试
+14) 查更新
+15) 更新
 0) 退出
 EOF
-    read_menu_input choice "请选择操作："
+    read_menu_input choice "选择："
     case "$choice" in
       1)
         run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" verify
         pause_menu
         ;;
       2)
-        run_menu_command systemctl status proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx certbot.timer --no-pager
+        run_menu_command show_service_status
         pause_menu
         ;;
       3)
-        read_menu_input name "请输入用户名："
+        read_menu_input name "用户名："
         [[ -n "$name" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user add "$name"
         pause_menu
         ;;
       4)
-        read_menu_input prefix "请输入用户名前缀："
-        read_menu_input count "请输入数量："
-        read_menu_input start "请输入起始序号（默认 1）："
+        read_menu_input prefix "前缀："
+        read_menu_input count "数量："
+        read_menu_input start "起始（默认 1）："
         start="${start:-1}"
         [[ -n "$prefix" && -n "$count" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user batch-add "$prefix" "$count" "$start"
         pause_menu
@@ -559,39 +612,39 @@ EOF
         pause_menu
         ;;
       6)
-        read_menu_input key "请输入用户名或 slug："
+        read_menu_input key "用户/slug："
         [[ -n "$key" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user share "$key"
         pause_menu
         ;;
       7)
-        read_menu_input key "请输入要禁用的用户名或 slug："
+        read_menu_input key "用户/slug："
         [[ -n "$key" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user disable "$key"
         pause_menu
         ;;
       8)
-        read_menu_input key "请输入要启用的用户名或 slug："
+        read_menu_input key "用户/slug："
         [[ -n "$key" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user enable "$key"
         pause_menu
         ;;
       9)
-        read_menu_input key "请输入要删除的用户名或 slug："
+        read_menu_input key "用户/slug："
         if [[ -n "$key" ]]; then
-          read_menu_input confirm "确认删除 ${key}？输入 yes 确认："
+          read_menu_input confirm "删除 ${key}？输入 yes："
           [[ "$confirm" == "yes" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user del "$key"
         fi
         pause_menu
         ;;
       10)
-        read_menu_input format "导出格式 csv/json/text（默认 csv）："
+        read_menu_input format "格式 csv/json/text（默认 csv）："
         format="${format:-csv}"
-        read_menu_input out_path "导出路径（留空使用默认路径）："
+        read_menu_input out_path "路径（留空默认）："
         run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user export "$format" "$out_path"
         pause_menu
         ;;
       11)
-        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" render
-        run_menu_command systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
-        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" verify
+        run_menu_command progress_step 1 3 "生成配置" bash "$SCRIPT_DIR/proxy-stack.sh" render
+        run_menu_command progress_step 2 3 "重启服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
+        run_menu_command progress_step 3 3 "验证服务" bash "$SCRIPT_DIR/proxy-stack.sh" verify
         pause_menu
         ;;
       12)

@@ -16,6 +16,7 @@ APP_PORT="9080"
 WEB_TLS_PORT="9443"
 MGMT_TLS_PORT="9444"
 VLESS_INTERNAL_PORT="10443"
+PROXY_STACK_LOG_FILE="${PROXY_STACK_LOG_FILE:-/var/log/proxy-stack.log}"
 
 log() {
   printf '[proxy-stack] %s\n' "$*"
@@ -35,6 +36,57 @@ require_cmd() {
   for cmd in "$@"; do
     command -v "$cmd" >/dev/null 2>&1 || die "缺少命令：$cmd"
   done
+}
+
+ensure_log_file() {
+  local dir
+  dir="$(dirname "$PROXY_STACK_LOG_FILE")"
+  mkdir -p "$dir"
+  touch "$PROXY_STACK_LOG_FILE"
+  chmod 600 "$PROXY_STACK_LOG_FILE" 2>/dev/null || true
+}
+
+quiet_cmd() {
+  local label="$1"
+  shift
+  ensure_log_file
+  if ! "$@" >>"$PROXY_STACK_LOG_FILE" 2>&1; then
+    die "${label}失败，详细日志：$PROXY_STACK_LOG_FILE"
+  fi
+}
+
+progress_bar() {
+  local current="$1"
+  local total="$2"
+  local width=24
+  local filled empty percent
+  (( total > 0 )) || total=1
+  (( current < 0 )) && current=0
+  (( current > total )) && current="$total"
+  filled=$((current * width / total))
+  empty=$((width - filled))
+  percent=$((current * 100 / total))
+  printf '['
+  printf '%*s' "$filled" '' | tr ' ' '#'
+  printf '%*s' "$empty" '' | tr ' ' '-'
+  printf '] %3d%%' "$percent"
+}
+
+progress_step() {
+  local current="$1"
+  local total="$2"
+  local label="$3"
+  local bar
+  shift 3
+  ensure_log_file
+  bar="$(progress_bar "$current" "$total")"
+  printf '%s %s ... ' "$bar" "$label"
+  if ( "$@" ) >>"$PROXY_STACK_LOG_FILE" 2>&1; then
+    printf '完成\n'
+  else
+    printf '失败\n' >&2
+    die "${label}失败，详细日志：$PROXY_STACK_LOG_FILE"
+  fi
 }
 
 is_placeholder_domain() {
@@ -210,16 +262,16 @@ PY
 }
 
 reload_nginx() {
-  nginx -t
+  quiet_cmd "检测 nginx 配置" nginx -t
   if systemctl is-active --quiet nginx; then
-    systemctl reload nginx
+    quiet_cmd "重载 nginx" systemctl reload nginx
   else
-    systemctl restart nginx
+    quiet_cmd "启动 nginx" systemctl restart nginx
   fi
 }
 
 systemd_reload() {
-  systemctl daemon-reload
+  quiet_cmd "重载 systemd" systemctl daemon-reload
 }
 
 disable_legacy_hcrx_conf() {
