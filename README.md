@@ -19,6 +19,10 @@ Ubuntu 一键部署五协议安全代理栈：VLESS + REALITY + Vision、Hysteri
 - 安装、更新和续签测试使用步骤进度条；详细命令日志写入 `/var/log/proxy-stack.log`，避免终端滚屏。
 - 用户管理：新增、批量新增、禁用、启用、删除、导出。
 - 安全默认值：公网只能使用高熵 slug、禁用用户立即失效、客户端不开放 LAN、服务降权运行、阻断私网/环回/云元数据、二进制固定版本和 SHA-256。
+- 安全下载与解压：远程项目包强制要求可信 SHA-256；所有 tar/zip 只允许普通文件和目录，并拒绝路径穿越、链接、设备文件、重复路径、特殊权限和解压炸弹。
+- Web 抗扫描：真实来源 IP 经 PROXY protocol 传递，按公网 IP 限速/限连接；应用限制 URI、查询字段、请求体和线程数，并使用 nonce CSP。
+
+完整复核范围、已修复问题、验证证据和仍不可消除的风险见 [安全审计报告](SECURITY_AUDIT.md)。
 
 ## 1.x 与 2.0 的主要区别
 
@@ -34,7 +38,7 @@ Ubuntu 一键部署五协议安全代理栈：VLESS + REALITY + Vision、Hysteri
 | 私钥隔离 | Web 服务读取包含协议私钥的整个配置 | Web 只读取专用配置；REALITY 私钥只给 Xray，TLS 私钥副本只给专用证书组 |
 | 出站边界 | 无统一的私网/元数据阻断 | 五路协议统一阻断环回、私网、链路本地和云元数据地址 |
 | 依赖下载 | 从最新 Release 动态下载，未固定文件哈希 | 固定 Xray、Hysteria2、sing-box 版本和 SHA-256，校验失败立即终止 |
-| 项目更新 | 下载远程 tarball 后直接覆盖 | 必须预先提供可信 `PROXY_STACK_UPDATE_SHA256`，否则拒绝更新 |
+| 项目更新 | 下载远程 tarball 后直接覆盖 | 必须预先提供可信 SHA-256；安全解压会拒绝路径穿越、链接、特殊文件和解压炸弹 |
 | SSH 防护 | 未由项目统一管理 | 3 次失败封 24 小时，长期累计第 11 次永久封禁，再加重犯永久封禁 |
 | 管理菜单 | 基础用户、证书和更新操作 | 全中文主菜单，新增订阅访问控制和 SSH 安全防护子菜单 |
 
@@ -89,9 +93,13 @@ curl -fsSLo /tmp/proxy-stack-deploy.sh \
   https://raw.githubusercontent.com/HCRXchenghong/proxy-stack/main/deploy.sh
 less /tmp/proxy-stack-deploy.sh
 sudo bash /tmp/proxy-stack-deploy.sh \
+  --tarball-url https://github.com/HCRXchenghong/proxy-stack/archive/refs/tags/<已审阅的版本标签>.tar.gz \
+  --tarball-sha256 <从独立可信渠道核对的64位SHA256> \
   --web-domain node.你的真实域名.com \
   --cert-email admin@你的真实域名.com
 ```
+
+远程引导部署强制要求 `--tarball-sha256`。这个值必须从发布者签名公告、已核对的发布记录或其他独立可信渠道取得；只下载归档后立刻对同一份未知文件计算哈希，不能证明归档可信。本地项目部署不需要该参数。
 
 脚本会在安装前检查：
 
@@ -113,6 +121,8 @@ sudo bash /tmp/proxy-stack-deploy.sh \
 --tls-key-file <path>            使用已有 TLS 私钥
 --install-dir <path>             安装目录，默认 /root/proxy-stack
 --branch <name>                  远程引导部署使用的 Git 分支，默认 main
+--tarball-url <https-url>        指定远程项目归档；建议固定到不可变版本标签
+--tarball-sha256 <sha256>        远程项目归档的可信 SHA-256（强制）
 -y, --yes                        跳过交互确认
 ```
 
@@ -146,7 +156,9 @@ sudo PROXY_STACK_UPDATE_SHA256=<64位SHA256> \
   bash /root/proxy-stack/proxy-stack.sh update
 ```
 
-当前正式版本：`2.0.0`。版本检测规则为：优先读取 GitHub 最新 Release；如果没有 Release，则读取最新 Tag。菜单中的更新操作也必须提供可信 SHA-256 环境变量。
+当前项目版本：`2.0.1`。它是兼容 `2.0.0` 的安全加固补丁，补充了安全解压、真实来源 IP、DNS 重绑定/SSRF 防护、Web 资源限制、原子状态写入和更严格的服务沙箱，不改变五路协议及现有用户的使用方式。版本检测规则为：优先读取 GitHub 最新 Release；如果没有 Release，则读取最新 Tag。菜单中的更新操作也必须提供可信 SHA-256 环境变量。
+
+安装目录会被规范化并限制在专用子目录内；拒绝 `/`、系统顶层目录、符号链接、非 root 所有或组/其他用户可写的既有目录，避免 root 部署时误覆盖系统文件。
 
 主要运行文件：
 
@@ -195,6 +207,8 @@ sudo bash /root/proxy-stack/proxy-stack.sh user del alice
 sudo bash /root/proxy-stack/proxy-stack.sh user export csv /root/proxy-stack-users.csv
 ```
 
+导出文件包含完整节点凭据，只允许写入 `/root`、`/home/<用户>` 或 `/var/backups` 的专用子目录，扩展名必须与格式匹配；脚本拒绝符号链接并使用 `0600` 原子写入，避免误覆盖系统文件。
+
 订阅默认不再只依赖 slug。每个新用户都会自动生成一个 `default` 设备令牌，`user show`、`user share` 和导出文件会自动带上它。管理额外设备与 IP 白名单：
 
 ```bash
@@ -216,6 +230,8 @@ sudo bash /root/proxy-stack/proxy-stack.sh user deny-ip alice 203.0.113.8/32
 ```
 
 这里的“允许客户端”指被管理员发放了独立令牌的设备，不依赖可伪造的 User-Agent。令牌仍是 bearer secret；如果被复制，持有者可以冒用，因此最高安全用法是“每台设备一枚令牌 + 设备 IP/CIDR 绑定”。撤销设备后立即失效，无需重启代理服务。鉴权失败统一返回 404，nginx 访问日志不记录 URL，页面也禁止 Referrer 外传。
+
+TCP 443 的外层 stream 分流通过 PROXY protocol 把真实来源地址传给内层 HTTPS，Xray 同步显式接收该协议。因此 IP/CIDR 白名单、访问日志和 nginx 限速使用的是实际公网来源 IP，不会把所有用户错误识别成 `127.0.0.1`。
 
 `user list` 输出三列：用户名、slug、状态。状态会显示为 `启用` 或 `禁用`。
 
@@ -296,7 +312,7 @@ sudo bash /root/proxy-stack/proxy-stack.sh security unban 198.51.100.8
    ```
 
 2. 检查云安全组/防火墙，在原 TCP/UDP 443 基础上放行 TCP 8443、UDP 8443 和 TCP 8444。
-3. 从 GitHub 取得并审阅 `v2.0.0` 标签的代码，再使用原来的真实 `WEB_DOMAIN`、证书邮箱或现有证书路径执行 `deploy.sh`。不要把未审阅的网络响应直接管道给 root shell。
+3. 从 GitHub 取得并审阅最新的 `v2.0.1` 标签代码，再使用原来的真实 `WEB_DOMAIN`、证书邮箱或现有证书路径执行 `deploy.sh`。不要把未审阅的网络响应直接管道给 root shell。
 4. 首次 `render` 会把 `users.json` 升级到新结构，完成安全凭据轮换，为每个现有用户创建 `default` 设备令牌，并生成 AnyTLS、TUIC 和 NaiveProxy 凭据。这个迁移只会针对旧结构执行一次。
 5. 升级后立即重新导出并分发用户链接：
 

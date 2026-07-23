@@ -6,6 +6,7 @@ REPO_URL="${PROXY_STACK_REPO_URL:-https://github.com/HCRXchenghong/proxy-stack}"
 BRANCH="${PROXY_STACK_BRANCH:-main}"
 INSTALL_DIR="${PROXY_STACK_INSTALL_DIR:-/root/proxy-stack}"
 TARBALL_URL="${PROXY_STACK_TARBALL_URL:-}"
+TARBALL_SHA256="${PROXY_STACK_TARBALL_SHA256:-}"
 
 WEB_DOMAIN="${WEB_DOMAIN:-}"
 MANAGEMENT_DOMAIN="${MANAGEMENT_DOMAIN:-${MGMT_DOMAIN:-}}"
@@ -84,13 +85,16 @@ usage() {
   --install-dir <路径>           本地安装目录；默认 /root/proxy-stack。
   --repo-url <url>               curl 管道部署时下载项目的仓库地址。
   --branch <分支名>              curl 管道部署时下载项目的分支；默认 main。
+  --tarball-url <https-url>      远程项目归档地址；设置后不再拼接仓库分支地址。
+  --tarball-sha256 <sha256>      远程项目归档的可信 SHA-256；远程部署时强制要求。
   -y, --yes                      跳过最终确认。
   -h, --help                     显示帮助。
 
 也支持同名环境变量：
   WEB_DOMAIN, MANAGEMENT_DOMAIN, CERT_EMAIL, TLS_CERT_FILE, TLS_KEY_FILE,
   PUBLIC_IP, REALITY_TARGET, REALITY_SNI, PROXY_STACK_INSTALL_DIR,
-  PROXY_STACK_REPO_URL, PROXY_STACK_BRANCH.
+  PROXY_STACK_REPO_URL, PROXY_STACK_BRANCH, PROXY_STACK_TARBALL_URL,
+  PROXY_STACK_TARBALL_SHA256.
 EOF
 }
 
@@ -107,6 +111,8 @@ while [[ $# -gt 0 ]]; do
     --install-dir) INSTALL_DIR="${2:-}"; shift 2 ;;
     --repo-url) REPO_URL="${2:-}"; shift 2 ;;
     --branch) BRANCH="${2:-}"; shift 2 ;;
+    --tarball-url) TARBALL_URL="${2:-}"; shift 2 ;;
+    --tarball-sha256) TARBALL_SHA256="${2:-}"; shift 2 ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "未知选项：$1" ;;
@@ -162,6 +168,147 @@ normalize_repo_url() {
   printf '%s\n' "$url"
 }
 
+validate_remote_source() {
+  local repo
+  repo="$(normalize_repo_url "$REPO_URL")"
+  [[ "$repo" =~ ^https://github.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || die "--repo-url 只允许不含凭据、查询参数和片段的 GitHub HTTPS 仓库地址"
+  [[ "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]] \
+    || die "--branch 包含不安全字符"
+  [[ "$BRANCH" != *".."* && "$BRANCH" != *"//"* && "$BRANCH" != */ ]] \
+    || die "--branch 格式无效"
+  if [[ -n "$TARBALL_URL" ]]; then
+    [[ "$TARBALL_URL" =~ ^https://[^[:space:]#]+$ ]] \
+      || die "--tarball-url 必须是不含片段的 HTTPS 地址"
+  fi
+}
+
+validate_install_dir() {
+  local canonical owner permissions
+  [[ "$INSTALL_DIR" =~ ^/[A-Za-z0-9._/+-]+$ ]] \
+    || die "--install-dir 必须是仅含安全字符的绝对路径"
+  [[ "$INSTALL_DIR" != *"/../"* && "$INSTALL_DIR" != */.. && "$INSTALL_DIR" != *"/./"* ]] \
+    || die "--install-dir 不能包含 . 或 .. 路径段"
+  canonical="$(realpath -m -- "$INSTALL_DIR")" || die "无法规范化 --install-dir"
+  case "$canonical" in
+    /root/*|/opt/*|/srv/*|/usr/local/src/*|/home/*/*) ;;
+    *) die "--install-dir 必须位于专用子目录中（/root、/opt、/srv、/usr/local/src 或 /home/<用户> 下）" ;;
+  esac
+  [[ ! -L "$INSTALL_DIR" ]] || die "--install-dir 不能是符号链接"
+  if [[ -e "$canonical" ]]; then
+    [[ -d "$canonical" ]] || die "--install-dir 已存在但不是目录"
+    owner="$(stat -c '%u' "$canonical")"
+    permissions="$(stat -c '%a' "$canonical")"
+    [[ "$owner" == "0" ]] || die "已有安装目录必须由 root 拥有：$canonical"
+    (( (8#$permissions & 8#022) == 0 )) || die "已有安装目录不能允许组或其他用户写入：$canonical"
+  fi
+  INSTALL_DIR="$canonical"
+}
+
+curl_https_download() {
+  local url="$1" output="$2"
+  [[ "$url" == https://* ]] || die "拒绝非 HTTPS 下载地址：$url"
+  curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 10 --max-time 300 \
+    --retry 3 --retry-delay 2 --retry-all-errors \
+    --max-filesize 536870912 \
+    --output "$output" -- "$url"
+}
+
+safe_extract_tar() {
+  local archive="$1" destination="$2"
+  require_cmd python3
+  install -d -m 0700 "$destination"
+  python3 - "$archive" "$destination" <<'PY'
+import os
+import shutil
+import sys
+import tarfile
+from pathlib import Path
+
+archive, destination = map(Path, sys.argv[1:3])
+MAX_MEMBERS = 10_000
+MAX_MEMBER_SIZE = 256 * 1024 * 1024
+MAX_TOTAL_SIZE = 512 * 1024 * 1024
+
+
+def clean_parts(name):
+    if not name or len(name) > 1024 or name.startswith("/") or "\\" in name or "\x00" in name:
+        raise ValueError(f"归档包含危险路径：{name!r}")
+    stripped = name[:-1] if name.endswith("/") else name
+    parts = stripped.split("/")
+    if not stripped or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"归档包含危险路径：{name!r}")
+    return tuple(parts)
+
+
+try:
+    with tarfile.open(archive, mode="r:*") as handle:
+        members = handle.getmembers()
+        if len(members) > MAX_MEMBERS:
+            raise ValueError("归档成员数量超过安全上限")
+        entries = []
+        seen = set()
+        files = set()
+        total_size = 0
+        for member in members:
+            if member.isfile():
+                kind = "file"
+            elif member.isdir():
+                kind = "dir"
+            else:
+                raise ValueError(f"归档包含链接或特殊文件：{member.name!r}")
+            parts = clean_parts(member.name)
+            if parts in seen:
+                raise ValueError("归档包含重复路径")
+            seen.add(parts)
+            if member.mode & 0o7000:
+                raise ValueError("归档包含 setuid/setgid/sticky 权限")
+            if kind == "file":
+                if member.size < 0 or member.size > MAX_MEMBER_SIZE:
+                    raise ValueError("归档单个文件超过安全上限")
+                total_size += member.size
+                files.add(parts)
+            entries.append((member, parts, kind))
+        if total_size > MAX_TOTAL_SIZE:
+            raise ValueError("归档解压总大小超过安全上限")
+        for _, parts, _ in entries:
+            if any(parts[:index] in files for index in range(1, len(parts))):
+                raise ValueError("归档中文件与目录路径发生冲突")
+
+        directories = []
+        for member, parts, kind in entries:
+            target = destination.joinpath(*parts)
+            if kind == "dir":
+                target.mkdir(parents=True, exist_ok=True)
+                directories.append((target, member.mode))
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = handle.extractfile(member)
+            if source is None:
+                raise ValueError("归档普通文件无法读取")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(target, flags, 0o600)
+            try:
+                with source, os.fdopen(fd, "wb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            os.chmod(target, member.mode & 0o777)
+        for target, mode in sorted(directories, key=lambda item: len(item[0].parts), reverse=True):
+            os.chmod(target, mode & 0o777)
+except (OSError, tarfile.TarError, ValueError) as exc:
+    raise SystemExit(f"安全解压失败：{exc}")
+PY
+}
+
 script_dir() {
   local src="${BASH_SOURCE[0]:-$0}"
   local dir
@@ -186,23 +333,34 @@ copy_local_payload() {
   fi
   chmod 0755 "$dst/proxy-stack.sh"
   [[ -f "$dst/deploy.sh" ]] && chmod 0755 "$dst/deploy.sh"
+  chown -R root:root "$dst"
+  chmod 0755 "$dst"
 }
 
 download_payload() {
   local dst="$1"
-  local tmp archive src repo
-  require_cmd curl tar
+  local tmp archive unpack src repo archive_sha
+  local -a roots
+  require_cmd curl python3 sha256sum
+  [[ "$TARBALL_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "远程部署必须提供可信的 --tarball-sha256（64 位 SHA-256）"
   tmp="$(mktemp -d)"
   archive="$tmp/proxy-stack.tar.gz"
+  unpack="$tmp/unpack"
   if [[ -n "$TARBALL_URL" ]]; then
-    curl -fsSL "$TARBALL_URL" -o "$archive"
+    curl_https_download "$TARBALL_URL" "$archive"
   else
     repo="$(normalize_repo_url "$REPO_URL")"
-    curl -fsSL "${repo}/archive/refs/heads/${BRANCH}.tar.gz" -o "$archive"
+    curl_https_download "${repo}/archive/refs/heads/${BRANCH}.tar.gz" "$archive"
   fi
-  tar -xzf "$archive" -C "$tmp"
-  src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  [[ -n "$src" ]] || die "解压仓库压缩包失败"
+  archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
+  [[ "$archive_sha" == "${TARBALL_SHA256,,}" ]] \
+    || die "远程项目归档 SHA-256 校验失败，已拒绝执行"
+  safe_extract_tar "$archive" "$unpack"
+  mapfile -d '' -t roots < <(find "$unpack" -mindepth 1 -maxdepth 1 -print0)
+  [[ "${#roots[@]}" -eq 1 && -d "${roots[0]}" ]] \
+    || die "项目归档必须只包含一个顶层目录"
+  src="${roots[0]}"
   [[ -f "$src/proxy-stack.sh" && -f "$src/app.py" && -f "$src/lib/common.sh" && -f "$src/lib/render.sh" ]] \
     || die "项目下载包缺少必要文件"
   bash -n "$src/proxy-stack.sh" "$src/lib/common.sh" "$src/lib/render.sh"
@@ -213,6 +371,8 @@ download_payload() {
   cp -a "$src/." "$dst/"
   chmod 0755 "$dst/proxy-stack.sh"
   [[ -f "$dst/deploy.sh" ]] && chmod 0755 "$dst/deploy.sh"
+  chown -R root:root "$dst"
+  chmod 0755 "$dst"
   rm -rf "$tmp"
 }
 
@@ -237,7 +397,12 @@ validate_inputs() {
     validate_domain_arg "--management-domain" "$MANAGEMENT_DOMAIN"
     [[ "$WEB_DOMAIN" != "$MANAGEMENT_DOMAIN" ]] || die "用户域名和管理域名不能相同"
   fi
-  [[ "$INSTALL_DIR" == /* ]] || die "--install-dir 必须是绝对路径"
+  validate_install_dir
+  validate_remote_source
+  if [[ -n "$TARBALL_SHA256" ]]; then
+    [[ "$TARBALL_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] \
+      || die "--tarball-sha256 必须是 64 位十六进制 SHA-256"
+  fi
   if [[ -n "$TLS_CERT_FILE" || -n "$TLS_KEY_FILE" ]]; then
     [[ -n "$TLS_CERT_FILE" && -n "$TLS_KEY_FILE" ]] || die "请同时提供 --tls-cert-file 和 --tls-key-file"
     [[ -f "$TLS_CERT_FILE" ]] || die "TLS 证书文件不存在：$TLS_CERT_FILE"

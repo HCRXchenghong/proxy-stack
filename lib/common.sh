@@ -2,12 +2,12 @@
 set -euo pipefail
 umask 077
 
+# This file is sourced by multiple scripts; many globals are consumed by the caller.
+# shellcheck disable=SC2034
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="/etc/proxy-stack"
 RUNTIME_DIR="/opt/proxy-stack"
 WEB_ROOT="/var/www/proxy-stack"
-ACME_HOME="$RUNTIME_DIR/acme.sh"
-XRAY_HOME="$RUNTIME_DIR/xray"
 BIN_DIR="$RUNTIME_DIR/bin"
 WEB_SERVICE_USER="proxy-stack-web"
 WEB_SERVICE_GROUP="proxy-stack-web"
@@ -51,6 +51,172 @@ require_cmd() {
   for cmd in "$@"; do
     command -v "$cmd" >/dev/null 2>&1 || die "缺少命令：$cmd"
   done
+}
+
+curl_https_download() {
+  local url="$1"
+  local output="$2"
+  local max_time="${3:-300}"
+  [[ "$url" == https://* ]] || die "拒绝非 HTTPS 下载地址：$url"
+  [[ "$max_time" =~ ^[0-9]+$ ]] || die "下载超时参数无效"
+  curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 10 --max-time "$max_time" \
+    --retry 3 --retry-delay 2 --retry-all-errors \
+    --max-filesize 536870912 \
+    --output "$output" -- "$url"
+}
+
+safe_extract_archive() {
+  local archive_type="$1"
+  local archive="$2"
+  local destination="$3"
+  require_cmd python3
+  [[ -f "$archive" ]] || die "归档文件不存在：$archive"
+  [[ "$archive_type" == "tar" || "$archive_type" == "zip" ]] \
+    || die "不支持的归档类型：$archive_type"
+  install -d -m 0700 "$destination"
+  python3 - "$archive_type" "$archive" "$destination" <<'PY'
+import os
+import shutil
+import stat
+import sys
+import tarfile
+import zipfile
+from pathlib import Path
+
+archive_type, archive_name, destination_name = sys.argv[1:4]
+archive = Path(archive_name)
+destination = Path(destination_name)
+MAX_MEMBERS = 10_000
+MAX_MEMBER_SIZE = 256 * 1024 * 1024
+MAX_TOTAL_SIZE = 512 * 1024 * 1024
+
+
+def clean_parts(name):
+    if not isinstance(name, str) or not name or len(name) > 1024:
+        raise ValueError("归档成员名称无效")
+    if name.startswith("/") or "\\" in name or "\x00" in name:
+        raise ValueError(f"归档包含危险路径：{name!r}")
+    stripped = name[:-1] if name.endswith("/") else name
+    parts = stripped.split("/")
+    if not stripped or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"归档包含危险路径：{name!r}")
+    return tuple(parts)
+
+
+def validate_entries(entries):
+    if len(entries) > MAX_MEMBERS:
+        raise ValueError("归档成员数量超过安全上限")
+    seen = set()
+    files = set()
+    total_size = 0
+    for entry in entries:
+        parts = entry["parts"]
+        if parts in seen:
+            raise ValueError("归档包含重复路径")
+        seen.add(parts)
+        if entry["kind"] == "file":
+            size = entry["size"]
+            if size < 0 or size > MAX_MEMBER_SIZE:
+                raise ValueError("归档单个文件超过安全上限")
+            total_size += size
+            files.add(parts)
+        if entry["mode"] & 0o7000:
+            raise ValueError("归档包含 setuid/setgid/sticky 权限")
+    if total_size > MAX_TOTAL_SIZE:
+        raise ValueError("归档解压总大小超过安全上限")
+    for entry in entries:
+        parts = entry["parts"]
+        for index in range(1, len(parts)):
+            if parts[:index] in files:
+                raise ValueError("归档中文件与目录路径发生冲突")
+
+
+def write_entries(entries, opener):
+    directories = []
+    for entry in entries:
+        target = destination.joinpath(*entry["parts"])
+        if entry["kind"] == "dir":
+            target.mkdir(parents=True, exist_ok=True)
+            directories.append((target, entry["mode"]))
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = opener(entry["source"])
+        if source is None:
+            raise ValueError("归档普通文件无法读取")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(target, flags, 0o600)
+        try:
+            with source, os.fdopen(fd, "wb") as output:
+                shutil.copyfileobj(source, output, length=1024 * 1024)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.chmod(target, entry["mode"] & 0o777)
+    for target, mode in sorted(directories, key=lambda item: len(item[0].parts), reverse=True):
+        os.chmod(target, mode & 0o777)
+
+
+try:
+    if archive_type == "tar":
+        with tarfile.open(archive, mode="r:*") as handle:
+            entries = []
+            for member in handle.getmembers():
+                if member.isfile():
+                    kind = "file"
+                elif member.isdir():
+                    kind = "dir"
+                else:
+                    raise ValueError(f"归档包含链接或特殊文件：{member.name!r}")
+                entries.append({
+                    "parts": clean_parts(member.name),
+                    "kind": kind,
+                    "size": member.size,
+                    "mode": member.mode,
+                    "source": member,
+                })
+            validate_entries(entries)
+            write_entries(entries, handle.extractfile)
+    else:
+        with zipfile.ZipFile(archive) as handle:
+            entries = []
+            for info in handle.infolist():
+                mode = (info.external_attr >> 16) & 0xFFFF
+                file_type = stat.S_IFMT(mode)
+                if info.flag_bits & 0x1:
+                    raise ValueError("归档包含加密成员")
+                if info.is_dir():
+                    kind = "dir"
+                elif file_type not in {0, stat.S_IFREG}:
+                    raise ValueError(f"归档包含链接或特殊文件：{info.filename!r}")
+                else:
+                    kind = "file"
+                entries.append({
+                    "parts": clean_parts(info.filename),
+                    "kind": kind,
+                    "size": info.file_size,
+                    "mode": mode or (0o755 if kind == "dir" else 0o644),
+                    "source": info,
+                })
+            validate_entries(entries)
+            write_entries(entries, handle.open)
+except (OSError, tarfile.TarError, zipfile.BadZipFile, ValueError) as exc:
+    raise SystemExit(f"安全解压失败：{exc}")
+PY
+}
+
+safe_extract_tar() {
+  safe_extract_archive tar "$1" "$2"
+}
+
+safe_extract_zip() {
+  safe_extract_archive zip "$1" "$2"
 }
 
 ensure_log_file() {
@@ -155,8 +321,9 @@ validate_reality_target() {
   local host="${target%:*}"
   local port="${target##*:}"
   is_valid_domain "$host" || die "--reality-target 主机名无效：$target"
-  [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) \
-    || die "--reality-target 端口无效：$target"
+  if [[ ! "$port" =~ ^[0-9]+$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+    die "--reality-target 端口无效：$target"
+  fi
 }
 
 prompt_value_if_tty() {
@@ -244,8 +411,11 @@ load_env() {
 
 save_env() {
   local env_file="$STATE_DIR/stack.env"
-  cat >"$env_file"
-  secure_root_file "$env_file"
+  local tmp_file
+  tmp_file="$(mktemp "$STATE_DIR/.stack.env.XXXXXX")"
+  cat >"$tmp_file"
+  secure_root_file "$tmp_file"
+  mv -f "$tmp_file" "$env_file"
 }
 
 ensure_env_defaults() {
@@ -321,7 +491,7 @@ random_hex() {
 
 random_token() {
   local n="${1:-24}"
-  openssl rand -base64 "$n" | tr -d '\n' | tr '/+' '_-'
+  openssl rand -base64 "$n" | tr -d '\n=' | tr '/+' '_-'
 }
 
 random_uuid() {
@@ -336,7 +506,10 @@ public_ipv4() {
     printf '%s\n' "$PUBLIC_IP_OVERRIDE"
     return
   fi
-  curl -fsSL --max-time 10 https://api.ipify.org
+  curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 5 --max-time 10 --retry 2 --retry-delay 1 \
+    --max-filesize 1024 -- https://api.ipify.org
 }
 
 resolve_domain_ipv4s() {
@@ -372,7 +545,9 @@ preflight_acme_dns() {
 ensure_nginx_stream_include() {
   grep -q 'include /etc/nginx/stream-conf.d/\*.conf;' /etc/nginx/nginx.conf && return 0
   python3 - <<'PY'
+import os
 import re
+import tempfile
 from pathlib import Path
 
 path = Path("/etc/nginx/nginx.conf")
@@ -386,7 +561,19 @@ if re.search(r"(?m)^stream\s*\{", text):
 else:
     text = text.rstrip() + "\n\nstream {\n" + include + "\n}\n"
 
-path.write_text(text)
+metadata = path.stat()
+fd, tmp_name = tempfile.mkstemp(prefix=".nginx-", suffix=".conf", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchown(handle.fileno(), metadata.st_uid, metadata.st_gid)
+        os.fchmod(handle.fileno(), metadata.st_mode & 0o777)
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_name, path)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
 PY
 }
 

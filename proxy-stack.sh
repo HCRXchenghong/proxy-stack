@@ -8,7 +8,6 @@ source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/render.sh"
 
 PROJECT_REPO_URL="${PROXY_STACK_REPO_URL:-https://github.com/HCRXchenghong/proxy-stack}"
-PROJECT_BRANCH="${PROXY_STACK_BRANCH:-main}"
 PROJECT_VERSION_FILE="$SCRIPT_DIR/VERSION"
 XRAY_VERSION="v26.3.27"
 XRAY_SHA256="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
@@ -70,14 +69,14 @@ EOF
 }
 
 download_xray() {
-  require_cmd curl sha256sum unzip
+  require_cmd curl sha256sum python3
   local url zip tmp
   url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
   tmp="$(mktemp -d)"
   zip="$tmp/xray.zip"
-  curl -fsSL "$url" -o "$zip"
+  curl_https_download "$url" "$zip"
   verify_sha256 "$zip" "$XRAY_SHA256"
-  unzip -qo "$zip" -d "$tmp/unpack"
+  safe_extract_zip "$zip" "$tmp/unpack"
   install -m 0755 "$tmp/unpack/xray" "${BIN_DIR}/xray"
   rm -rf "$tmp"
   log "已安装并校验 Xray ${XRAY_VERSION}"
@@ -88,7 +87,7 @@ download_hysteria() {
   local url tmp
   url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION}/hysteria-linux-amd64"
   tmp="$(mktemp)"
-  curl -fsSL "$url" -o "$tmp"
+  curl_https_download "$url" "$tmp"
   verify_sha256 "$tmp" "$HYSTERIA_SHA256"
   install -m 0755 "$tmp" "${BIN_DIR}/hysteria"
   rm -f "$tmp"
@@ -102,10 +101,10 @@ download_sing_box() {
   url="https://github.com/SagerNet/sing-box/releases/download/${SING_BOX_VERSION}/sing-box-${version}-linux-amd64.tar.gz"
   tmp="$(mktemp -d)"
   archive="$tmp/sing-box.tar.gz"
-  curl -fsSL "$url" -o "$archive"
+  curl_https_download "$url" "$archive"
   verify_sha256 "$archive" "$SING_BOX_SHA256"
-  tar -xzf "$archive" -C "$tmp"
-  binary="$(find "$tmp" -type f -name sing-box -perm -0100 | head -n 1)"
+  safe_extract_tar "$archive" "$tmp/unpack"
+  binary="$(find "$tmp/unpack" -type f -name sing-box -perm -0100 -print -quit)"
   [[ -n "$binary" ]] || die "sing-box 安装包中未找到可执行文件"
   install -m 0755 "$binary" "${BIN_DIR}/sing-box"
   rm -rf "$tmp"
@@ -126,7 +125,7 @@ install_pinned_proxy_binaries() {
 
 install_system_packages() {
   quiet_cmd "更新系统软件源" apt-get update
-  quiet_cmd "安装系统依赖" env DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip nginx libnginx-mod-stream certbot python3-certbot-nginx python3 fail2ban
+  quiet_cmd "安装系统依赖" env DEBIAN_FRONTEND=noninteractive apt-get install -y jq nginx libnginx-mod-stream certbot python3-certbot-nginx python3 fail2ban
 }
 
 install_fail2ban_if_needed() {
@@ -183,7 +182,7 @@ generate_env_file() {
   internal_proxy_token=""
   security_schema="2"
   if [[ -f "$STATE_DIR/stack.env" ]]; then
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090,SC1091
     source "$STATE_DIR/stack.env"
     private="${REALITY_PRIVATE_KEY:-}"
     public="${REALITY_PUBLIC_KEY:-}"
@@ -283,7 +282,7 @@ install_stack() {
     preflight_acme_dns "$public_ip" "$web_domain"
   fi
   progress_step 1 11 "安装依赖" install_system_packages
-  require_cmd jq unzip nginx certbot fail2ban-client
+  require_cmd jq nginx certbot fail2ban-client
   progress_step 2 11 "配置 nginx" ensure_nginx_stream_include
   progress_step 3 11 "启动 nginx" systemctl enable --now nginx
   progress_step 4 11 "安装 Xray" download_xray
@@ -297,7 +296,7 @@ install_stack() {
   write_users_json
   disable_legacy_hcrx_conf
   load_env
-  progress_step 7 11 "申请 SSL" issue_cert_if_needed "$TLS_CERT_FILE" "$TLS_KEY_FILE" "$CERT_EMAIL" "$WEB_DOMAIN"
+  progress_step 7 11 "申请 SSL" issue_cert_if_needed "$tls_cert" "$tls_key" "$cert_email" "$web_domain"
   progress_step 8 11 "启用续签" ensure_certbot_auto_renewal
   progress_step 9 11 "生成配置" render_stack
   progress_step 10 11 "启动服务" systemctl enable --now proxy-stack-xray proxy-stack-hysteria proxy-stack-sing-box proxy-stack-web
@@ -357,8 +356,7 @@ verify_stack() {
 
 wait_stack_ready() {
   local tries=30
-  local i
-  for i in $(seq 1 "$tries"); do
+  while (( tries > 0 )); do
     if systemctl is-active --quiet proxy-stack-xray \
       && systemctl is-active --quiet proxy-stack-hysteria \
       && systemctl is-active --quiet proxy-stack-sing-box \
@@ -366,6 +364,7 @@ wait_stack_ready() {
       && curl -fsS "http://127.0.0.1:${APP_PORT}/healthz" >/dev/null 2>&1; then
       return 0
     fi
+    tries=$((tries - 1))
     sleep 1
   done
   die "Proxy Stack 服务未能在预期时间内就绪"
@@ -422,7 +421,7 @@ normalize_project_repo_url() {
 github_project_parts() {
   local repo owner name
   repo="$(normalize_project_repo_url)"
-  if [[ "$repo" =~ ^https://github.com/([^/]+)/([^/]+)$ ]]; then
+  if [[ "$repo" =~ ^https://github.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$ ]]; then
     owner="${BASH_REMATCH[1]}"
     name="${BASH_REMATCH[2]}"
     printf '%s %s\n' "$owner" "$name"
@@ -433,10 +432,14 @@ github_project_parts() {
 
 github_api_get() {
   local url="$1"
-  curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
+  [[ "$url" == https://api.github.com/* ]] || die "拒绝非 GitHub API 地址：$url"
+  curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors \
+    --max-filesize 4194304 \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "$url"
+    -- "$url"
 }
 
 version_from_ref() {
@@ -543,15 +546,17 @@ download_project_payload() {
   local tarball_url="$2"
   local expected_sha256="$3"
   local expected_version="$4"
-  local tmp archive src archive_sha version
+  local tmp archive unpack src archive_sha version
   tmp="$(mktemp -d)"
   archive="$tmp/proxy-stack.tar.gz"
-  curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$tarball_url" -o "$archive"
+  unpack="$tmp/unpack"
+  curl_https_download "$tarball_url" "$archive"
   archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
   [[ "$archive_sha" == "$expected_sha256" ]] || die "更新包 SHA-256 校验失败，已拒绝覆盖当前版本"
-  tar -xzf "$archive" -C "$tmp"
-  src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  [[ -n "$src" ]] || die "解压更新包失败"
+  safe_extract_tar "$archive" "$unpack"
+  mapfile -d '' -t roots < <(find "$unpack" -mindepth 1 -maxdepth 1 -print0)
+  [[ "${#roots[@]}" -eq 1 && -d "${roots[0]}" ]] || die "更新包必须只包含一个顶层目录"
+  src="${roots[0]}"
   [[ -f "$src/proxy-stack.sh" && -f "$src/deploy.sh" && -f "$src/app.py" \
       && -f "$src/lib/common.sh" && -f "$src/lib/render.sh" && -f "$src/VERSION" ]] \
     || die "更新包缺少必要文件"
@@ -626,6 +631,7 @@ pause_menu() {
 confirm_menu_action() {
   local prompt="$1"
   local answer
+  # shellcheck disable=SC1111
   read_menu_input answer "${prompt}（输入“确认”继续）："
   [[ "$answer" == "确认" ]]
 }
@@ -1018,7 +1024,9 @@ user_add() {
   hy2="$(random_token 18)"
   python3 - "$STATE_DIR/users.json" "$name" "$slug" "$uuid" "$hy2" <<'PY'
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -1035,8 +1043,19 @@ users.append({
     "hy2_auth": hy2,
     "enabled": True,
 })
-path.write_text(json.dumps(data, indent=2))
+fd, tmp_name = tempfile.mkstemp(prefix=".users-", suffix=".json", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_name, 0o640)
+    os.replace(tmp_name, path)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
 PY
+  secure_state_file "$STATE_DIR/users.json" "$WEB_SERVICE_GROUP"
   render_stack
   reload_stack_services
   write_runtime_info
@@ -1052,8 +1071,10 @@ user_batch_add() {
   (( ${#prefix} <= 60 )) || die "用户名前缀最多 60 位"
   python3 - "$STATE_DIR/users.json" "$prefix" "$count" "$start" <<'PY'
 import json
+import os
 import secrets
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -1061,8 +1082,10 @@ path = Path(sys.argv[1])
 prefix = sys.argv[2]
 count = int(sys.argv[3])
 start = int(sys.argv[4])
-if count <= 0:
-    raise SystemExit("数量必须大于 0")
+if not 1 <= count <= 1000:
+    raise SystemExit("数量必须在 1 到 1000 之间")
+if not 0 <= start <= 999_999_999:
+    raise SystemExit("起始序号必须在 0 到 999999999 之间")
 def rand_slug():
     return secrets.token_urlsafe(24)
 
@@ -1075,6 +1098,8 @@ existing = {u["name"] for u in users}
 created = []
 for idx in range(start, start + count):
     name = f"{prefix}{idx:03d}"
+    if len(name) > 64:
+        raise SystemExit(f"生成的用户名超过 64 位：{name}")
     if name in existing:
       raise SystemExit(f"用户已存在：{name}")
     users.append({
@@ -1085,9 +1110,20 @@ for idx in range(start, start + count):
         "enabled": True,
     })
     created.append(name)
-path.write_text(json.dumps(data, indent=2))
+fd, tmp_name = tempfile.mkstemp(prefix=".users-", suffix=".json", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_name, 0o640)
+    os.replace(tmp_name, path)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
 print("\n".join(created))
 PY
+  secure_state_file "$STATE_DIR/users.json" "$WEB_SERVICE_GROUP"
   render_stack
   reload_stack_services
   write_runtime_info
@@ -1100,7 +1136,9 @@ user_set_enabled() {
   local want="${2:?必须提供启用状态}"
   python3 - "$STATE_DIR/users.json" "$key" "$want" <<'PY'
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -1108,14 +1146,28 @@ key = sys.argv[2]
 want = sys.argv[3].lower() == "true"
 data = json.loads(path.read_text())
 users = data.setdefault("users", [])
+matched = None
 for user in users:
     if user.get("name") == key or user.get("slug") == key:
         user["enabled"] = want
-        path.write_text(json.dumps(data, indent=2))
-        print(f'{user.get("name", key)}: {"enabled" if want else "disabled"}')
-        raise SystemExit(0)
-raise SystemExit("用户不存在")
+        matched = user
+        break
+if matched is None:
+    raise SystemExit("用户不存在")
+fd, tmp_name = tempfile.mkstemp(prefix=".users-", suffix=".json", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_name, 0o640)
+    os.replace(tmp_name, path)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
+print(f'{matched.get("name", key)}: {"enabled" if want else "disabled"}')
 PY
+  secure_state_file "$STATE_DIR/users.json" "$WEB_SERVICE_GROUP"
   render_stack
   reload_stack_services
   write_runtime_info
@@ -1127,7 +1179,9 @@ user_del() {
   local key="${1:?必须提供用户名称或 slug}"
   python3 - "$STATE_DIR/users.json" "$key" <<'PY'
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -1138,8 +1192,19 @@ filtered = [u for u in users if u.get("name") != key and u.get("slug") != key]
 if len(filtered) == len(users):
     raise SystemExit("用户不存在")
 data["users"] = filtered
-path.write_text(json.dumps(data, indent=2))
+fd, tmp_name = tempfile.mkstemp(prefix=".users-", suffix=".json", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_name, 0o640)
+    os.replace(tmp_name, path)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
 PY
+  secure_state_file "$STATE_DIR/users.json" "$WEB_SERVICE_GROUP"
   render_stack
   reload_stack_services
   write_runtime_info
@@ -1472,6 +1537,25 @@ NaiveProxy:
 PY
 }
 
+validate_export_path() {
+  local format="$1" value="$2" canonical
+  validate_safe_absolute_path "导出路径" "$value"
+  [[ "$value" != *"/../"* && "$value" != */.. && "$value" != *"/./"* ]] \
+    || die "导出路径不能包含 . 或 .. 路径段"
+  canonical="$(realpath -m -- "$value")" || die "无法规范化导出路径"
+  case "$canonical" in
+    /root/*|/home/*/*|/var/backups/*) ;;
+    *) die "导出文件只允许写入 /root、/home/<用户> 或 /var/backups 的子目录" ;;
+  esac
+  [[ ! -L "$value" ]] || die "导出目标不能是符号链接"
+  [[ ! -e "$canonical" || -f "$canonical" ]] || die "导出目标已存在但不是普通文件"
+  case "$format:$canonical" in
+    csv:*.csv|json:*.json|text:*.txt) ;;
+    *) die "导出文件扩展名必须与格式匹配（.csv/.json/.txt）" ;;
+  esac
+  printf '%s\n' "$canonical"
+}
+
 user_export() {
   require_root
   local format="${1:-csv}"
@@ -1491,10 +1575,13 @@ user_export() {
       die "不支持的导出格式：$format"
       ;;
   esac
+  out_path="$(validate_export_path "$format" "$out_path")"
   python3 - "$STATE_DIR/users.json" "$format" "$out_path" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" <<'PY'
 import csv
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
@@ -1553,30 +1640,38 @@ for u in users:
         "naive": naive,
     })
 
-out_path.parent.mkdir(parents=True, exist_ok=True)
-if fmt == "json":
-    out_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
-elif fmt == "csv":
-    with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "slug", "enabled", "web", "link", "mihomo", "node", "vless", "hy2", "anytls", "tuic", "naive"])
-        writer.writeheader()
-        writer.writerows(rows)
-else:
-    with out_path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(
-                f"[{row['name']}]\n"
-                f"状态: {'启用' if row['enabled'] else '禁用'}\n"
-                f"交付页面: {row['web']}\n"
-                f"通用订阅: {row['link']}\n"
-                f"Mihomo配置: {row['mihomo']}\n"
-                f"原始节点: {row['node']}\n"
-                f"VLESS链接: {row['vless']}\n"
-                f"Hysteria2链接: {row['hy2']}\n\n"
-                f"AnyTLS链接: {row['anytls']}\n"
-                f"TUIC链接: {row['tuic']}\n"
-                f"NaiveProxy链接: {row['naive']}\n\n"
-            )
+out_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+fd, tmp_name = tempfile.mkstemp(prefix=".proxy-stack-export-", dir=out_path.parent)
+try:
+    with os.fdopen(fd, "w", newline="" if fmt == "csv" else None, encoding="utf-8") as f:
+        if fmt == "json":
+            json.dump(rows, f, indent=2, ensure_ascii=False)
+        elif fmt == "csv":
+            writer = csv.DictWriter(f, fieldnames=["name", "slug", "enabled", "web", "link", "mihomo", "node", "vless", "hy2", "anytls", "tuic", "naive"])
+            writer.writeheader()
+            writer.writerows(rows)
+        else:
+            for row in rows:
+                f.write(
+                    f"[{row['name']}]\n"
+                    f"状态: {'启用' if row['enabled'] else '禁用'}\n"
+                    f"交付页面: {row['web']}\n"
+                    f"通用订阅: {row['link']}\n"
+                    f"Mihomo配置: {row['mihomo']}\n"
+                    f"原始节点: {row['node']}\n"
+                    f"VLESS链接: {row['vless']}\n"
+                    f"Hysteria2链接: {row['hy2']}\n\n"
+                    f"AnyTLS链接: {row['anytls']}\n"
+                    f"TUIC链接: {row['tuic']}\n"
+                    f"NaiveProxy链接: {row['naive']}\n\n"
+                )
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp_name, 0o600)
+    os.replace(tmp_name, out_path)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
 print(out_path)
 PY
   chmod 0600 "$out_path"

@@ -57,6 +57,9 @@ cfg = {
             "streamSettings": {
                 "network": "tcp",
                 "security": "reality",
+                "sockopt": {
+                    "acceptProxyProtocol": True,
+                },
                 "realitySettings": {
                     "show": False,
                     "target": env["REALITY_TARGET"],
@@ -83,7 +86,9 @@ cfg = {
                     "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
                     "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
                     "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-                    "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"
+                    "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96",
+                    "64:ff9b:1::/48", "100::/64", "2001:db8::/32",
+                    "2001:10::/28", "2001:20::/28", "fc00::/7", "fe80::/10", "ff00::/8"
                 ],
                 "outboundTag": "block",
             }
@@ -136,8 +141,16 @@ acl:
     - reject(240.0.0.0/4)
     - reject(::/128)
     - reject(::1/128)
+    - reject(::ffff:0:0/96)
+    - reject(64:ff9b::/96)
+    - reject(64:ff9b:1::/48)
+    - reject(100::/64)
+    - reject(2001:db8::/32)
+    - reject(2001:10::/28)
+    - reject(2001:20::/28)
     - reject(fc00::/7)
     - reject(fe80::/10)
+    - reject(ff00::/8)
 
 masquerade:
   type: string
@@ -274,6 +287,11 @@ def tls(alpn):
 
 cfg = {
     "log": {"level": "warn", "timestamp": True},
+    "dns": {
+        "servers": [{"type": "local", "tag": "local"}],
+        "strategy": "prefer_ipv4",
+        "independent_cache": True,
+    },
     "inbounds": [
         {
             "type": "anytls", "tag": "anytls-in", "listen": "::", "listen_port": anytls_port,
@@ -294,7 +312,21 @@ cfg = {
     ],
     "outbounds": [{"type": "direct", "tag": "direct"}],
     "route": {
-        "rules": [{"ip_is_private": True, "action": "reject"}],
+        "rules": [
+            {"action": "resolve", "server": "local", "strategy": "prefer_ipv4"},
+            {"ip_is_private": True, "action": "reject"},
+            {
+                "ip_cidr": [
+                    "0.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16",
+                    "192.0.0.0/24", "192.0.2.0/24", "198.18.0.0/15",
+                    "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+                    "::/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48",
+                    "100::/64", "2001:db8::/32", "2001:10::/28", "2001:20::/28", "ff00::/8",
+                ],
+                "action": "reject",
+            },
+        ],
+        "default_domain_resolver": "local",
         "final": "direct",
     },
 }
@@ -339,10 +371,14 @@ write_web_app() {
 write_nginx_acme_conf() {
   load_env
   cat >"$NGINX_ACME_CONF" <<EOF
+log_format proxy_stack_acme_safe '\$remote_addr [\$time_local] \$status \$request_method';
+
 server {
     listen 80;
     listen [::]:80;
     server_name ${WEB_DOMAIN};
+    access_log /var/log/nginx/proxy-stack-access.log proxy_stack_acme_safe;
+    error_log /var/log/nginx/proxy-stack-error.log crit;
 
     location ^~ /.well-known/acme-challenge/ {
         root ${WEB_ROOT};
@@ -361,14 +397,22 @@ write_nginx_http_conf() {
   write_nginx_acme_conf
 
   cat >"$NGINX_HTTP_CONF" <<EOF
-limit_req_zone \$binary_remote_addr zone=proxy_stack_web_rate:10m rate=10r/s;
+limit_req_zone \$binary_remote_addr zone=proxy_stack_web_rate:10m rate=5r/s;
 limit_conn_zone \$binary_remote_addr zone=proxy_stack_web_conn:10m;
 log_format proxy_stack_safe '\$remote_addr [\$time_local] \$status \$request_method';
 server_tokens off;
 
 server {
-    listen 127.0.0.1:${WEB_TLS_PORT} ssl http2;
+    listen 127.0.0.1:${WEB_TLS_PORT} ssl http2 proxy_protocol;
     server_name ${WEB_DOMAIN};
+
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
+    limit_req zone=proxy_stack_web_rate burst=10 nodelay;
+    limit_req_status 429;
+    limit_conn proxy_stack_web_conn 10;
+    limit_conn_status 429;
 
     ssl_certificate ${TLS_CERT_FILE};
     ssl_certificate_key ${TLS_KEY_FILE};
@@ -378,12 +422,20 @@ server {
     add_header X-Content-Type-Options nosniff always;
     add_header X-Frame-Options DENY always;
     add_header Referrer-Policy no-referrer always;
-    add_header Content-Security-Policy "default-src 'self' 'unsafe-inline' data:;" always;
     add_header Strict-Transport-Security "max-age=31536000" always;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header Cross-Origin-Opener-Policy same-origin always;
+    add_header Cross-Origin-Resource-Policy same-origin always;
     access_log /var/log/nginx/proxy-stack-access.log proxy_stack_safe;
+    error_log /var/log/nginx/proxy-stack-error.log crit;
 
-    client_max_body_size 16k;
+    client_max_body_size 4k;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 2 4k;
+    client_header_timeout 10s;
+    client_body_timeout 10s;
+    keepalive_timeout 15s;
+    send_timeout 15s;
 
     location = /hy2-auth {
         return 404;
@@ -400,8 +452,6 @@ server {
     }
 
     location ~ "^/(web|link|mihomo|node)/[A-Za-z0-9_-]{24,64}\$" {
-        limit_req zone=proxy_stack_web_rate burst=20 nodelay;
-        limit_conn proxy_stack_web_conn 20;
         proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_http_version 1.1;
         proxy_connect_timeout 5s;
@@ -411,7 +461,6 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Proxy-Stack-Internal ${INTERNAL_PROXY_TOKEN};
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
@@ -488,6 +537,7 @@ server {
     listen 443 reuseport;
     listen [::]:443 reuseport;
     proxy_pass \$proxy_stack_tcp_backend;
+    proxy_protocol on;
     ssl_preread on;
 }
 EOF
@@ -518,6 +568,16 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
@@ -552,6 +612,16 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
@@ -587,6 +657,16 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
@@ -620,6 +700,16 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

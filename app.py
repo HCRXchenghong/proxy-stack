@@ -5,11 +5,22 @@ import hmac
 import html
 import ipaddress
 import json
+import re
+import secrets
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
+
+
+MAX_USERS_FILE_BYTES = 16 * 1024 * 1024
+MAX_REQUEST_TARGET_LENGTH = 4096
+MAX_QUERY_LENGTH = 1024
+MAX_CLIENT_TOKEN_LENGTH = 256
+PUBLIC_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{24,64}$")
+DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def load_env(path: Path) -> dict:
@@ -23,6 +34,42 @@ def load_env(path: Path) -> dict:
     return env
 
 
+def validate_runtime_env(env: dict) -> bool:
+    """Reject malformed root-managed configuration before serving requests."""
+    required = (
+        "PUBLIC_IP",
+        "WEB_DOMAIN",
+        "REALITY_PUBLIC_KEY",
+        "REALITY_SNI",
+        "REALITY_SHORT_ID",
+        "ANYTLS_PORT",
+        "TUIC_PORT",
+        "NAIVE_PORT",
+        "INTERNAL_PROXY_TOKEN",
+    )
+    if not isinstance(env, dict) or any(not isinstance(env.get(key), str) for key in required):
+        return False
+    if any(not value or len(value) > 512 or any(char in value for char in "\r\n\x00") for value in env.values()):
+        return False
+    try:
+        if not isinstance(ipaddress.ip_address(env["PUBLIC_IP"]), ipaddress.IPv4Address):
+            return False
+        if any(not 1 <= int(env[key]) <= 65535 for key in ("ANYTLS_PORT", "TUIC_PORT", "NAIVE_PORT")):
+            return False
+    except ValueError:
+        return False
+    if not DOMAIN_RE.fullmatch(env["WEB_DOMAIN"]) or not DOMAIN_RE.fullmatch(env["REALITY_SNI"]):
+        return False
+    if not SAFE_TOKEN_RE.fullmatch(env["REALITY_PUBLIC_KEY"]):
+        return False
+    if not re.fullmatch(r"[0-9a-fA-F]{2,32}", env["REALITY_SHORT_ID"]):
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,256}", env["INTERNAL_PROXY_TOKEN"]):
+        return False
+    obfs = env.get("HY2_OBFS_PASSWORD", "")
+    return not obfs or bool(re.fullmatch(r"[A-Za-z0-9_-]{16,256}", obfs))
+
+
 def secure_compare(left, right) -> bool:
     try:
         return hmac.compare_digest(str(left), str(right))
@@ -30,18 +77,33 @@ def secure_compare(left, right) -> bool:
         return False
 
 
+def load_users(state_dir: Path) -> list[dict]:
+    """Load a bounded, minimally validated user list and fail closed."""
+    try:
+        path = state_dir / "users.json"
+        if path.stat().st_size > MAX_USERS_FILE_BYTES:
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+        users = data.get("users", []) if isinstance(data, dict) else []
+        return [user for user in users if isinstance(user, dict)] if isinstance(users, list) else []
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return []
+
+
 def find_user(state_dir: Path, slug: str):
     """Return an enabled user by the unguessable public slug only."""
-    data = json.loads((state_dir / "users.json").read_text())
-    for user in data.get("users", []):
+    if not isinstance(slug, str) or not PUBLIC_SLUG_RE.fullmatch(slug):
+        return None
+    for user in load_users(state_dir):
         if user.get("enabled", True) and secure_compare(user.get("slug", ""), slug):
             return user
     return None
 
 
 def find_user_by_hy2_auth(state_dir: Path, auth: str):
-    data = json.loads((state_dir / "users.json").read_text())
-    for user in data.get("users", []):
+    if not isinstance(auth, str) or not 1 <= len(auth) <= MAX_CLIENT_TOKEN_LENGTH:
+        return None
+    for user in load_users(state_dir):
         if user.get("enabled", True) and secure_compare(user.get("hy2_auth", ""), auth):
             return user
     return None
@@ -67,7 +129,9 @@ def ip_is_allowed(address: str, networks) -> bool:
 
 def authorize_subscription(user: dict, client_ip: str, supplied_tokens) -> tuple[bool, str]:
     """Authorize by a revocable client token or the user's source-IP allowlist."""
-    tokens = [str(token) for token in supplied_tokens if token]
+    if not isinstance(user, dict) or not isinstance(supplied_tokens, list):
+        return False, ""
+    tokens = [str(token) for token in supplied_tokens if token and len(str(token)) <= MAX_CLIENT_TOKEN_LENGTH]
     clients = user.get("subscription_clients", [])
     if isinstance(clients, list):
         for client in clients:
@@ -138,24 +202,24 @@ log-level: info
 proxies:
   - name: {yaml_string(names['vless'])}
     type: vless
-    server: {env['PUBLIC_IP']}
+    server: {yaml_string(env['PUBLIC_IP'])}
     port: 443
-    uuid: {user['vless_uuid']}
+    uuid: {yaml_string(user['vless_uuid'])}
     network: tcp
     tls: true
     udp: true
-    servername: {env['REALITY_SNI']}
+    servername: {yaml_string(env['REALITY_SNI'])}
     reality-opts:
-      public-key: {env['REALITY_PUBLIC_KEY']}
-      short-id: {env['REALITY_SHORT_ID']}
+      public-key: {yaml_string(env['REALITY_PUBLIC_KEY'])}
+      short-id: {yaml_string(env['REALITY_SHORT_ID'])}
     client-fingerprint: chrome
     flow: xtls-rprx-vision
   - name: {yaml_string(names['hy2'])}
     type: hysteria2
-    server: {env['PUBLIC_IP']}
+    server: {yaml_string(env['PUBLIC_IP'])}
     port: 443
-    password: "{user['hy2_auth']}"
-    sni: {env['WEB_DOMAIN']}
+    password: {yaml_string(user['hy2_auth'])}
+    sni: {yaml_string(env['WEB_DOMAIN'])}
     alpn:
       - h3
 """
@@ -166,23 +230,23 @@ proxies:
 """
     return base + f"""  - name: {yaml_string(names['anytls'])}
     type: anytls
-    server: {env['PUBLIC_IP']}
+    server: {yaml_string(env['PUBLIC_IP'])}
     port: {env['ANYTLS_PORT']}
     password: {yaml_string(user['anytls_password'])}
     client-fingerprint: chrome
     udp: true
-    sni: {env['WEB_DOMAIN']}
+    sni: {yaml_string(env['WEB_DOMAIN'])}
     alpn:
       - h2
       - http/1.1
     skip-cert-verify: false
   - name: {yaml_string(names['tuic'])}
     type: tuic
-    server: {env['PUBLIC_IP']}
+    server: {yaml_string(env['PUBLIC_IP'])}
     port: {env['TUIC_PORT']}
-    uuid: {user['tuic_uuid']}
+    uuid: {yaml_string(user['tuic_uuid'])}
     password: {yaml_string(user['tuic_password'])}
-    sni: {env['WEB_DOMAIN']}
+    sni: {yaml_string(env['WEB_DOMAIN'])}
     alpn:
       - h3
     disable-sni: false
@@ -202,7 +266,7 @@ rules:
 """
 
 
-def render_html(env: dict, user: dict, client_token: str = ""):
+def render_html(env: dict, user: dict, client_token: str = "", csp_nonce: str = ""):
     vless, hy2, anytls, tuic, naive = raw_links(env, user)
     slug = user["slug"]
     query = f"?client={quote(client_token, safe='')}" if client_token else ""
@@ -211,13 +275,14 @@ def render_html(env: dict, user: dict, client_token: str = ""):
     mihomo_url = f"https://{env['WEB_DOMAIN']}/mihomo/{slug}{query}"
     node_url = f"https://{env['WEB_DOMAIN']}/node/{slug}{query}"
     safe_name = html.escape(user["name"])
+    safe_nonce = html.escape(csp_nonce, quote=True)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{safe_name} - 节点交付</title>
-  <style>
+  <style nonce="{safe_nonce}">
     :root {{
       color-scheme: light;
       --bg: #f6f8fb;
@@ -394,7 +459,7 @@ def render_html(env: dict, user: dict, client_token: str = ""):
     </div>
   </main>
   <div class="toast" id="toast">已复制</div>
-  <script>
+  <script nonce="{safe_nonce}">
     const toast = document.getElementById('toast');
     function showToast(text) {{
       toast.textContent = text;
@@ -439,21 +504,37 @@ class App(BaseHTTPRequestHandler):
         tokens = query.get("client", [])
         if len(tokens) > 1:
             return []
-        result = [tokens[0]] if tokens else []
+        query_token = tokens[0] if tokens else ""
         authorization = self.headers.get("Authorization", "")
+        header_token = ""
         if authorization.startswith("Bearer "):
-            result.append(authorization[7:].strip())
-        return [token for token in result if token]
+            header_token = authorization[7:].strip()
+        if query_token and header_token and not secure_compare(query_token, header_token):
+            return []
+        token = query_token or header_token
+        if not token or len(token) > MAX_CLIENT_TOKEN_LENGTH:
+            return []
+        return [token]
 
     def do_GET(self):
-        parsed = urlsplit(self.path)
+        if len(self.path) > MAX_REQUEST_TARGET_LENGTH:
+            self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+            return
+        try:
+            parsed = urlsplit(self.path)
+        except ValueError:
+            self.send_error(HTTPStatus.BAD_REQUEST)
+            return
+        if len(parsed.query) > MAX_QUERY_LENGTH:
+            self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+            return
         parts = [p for p in parsed.path.split("/") if p]
         if not parts:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
         route = parts[0]
-        if parts == ["healthz"]:
+        if parts == ["healthz"] and parsed.path == "/healthz" and not parsed.query:
             self._send(HTTPStatus.OK, "text/plain; charset=utf-8", b"ok")
             return
         if len(parts) != 2 or route not in {"web", "link", "mihomo", "node"}:
@@ -461,12 +542,22 @@ class App(BaseHTTPRequestHandler):
             return
 
         key = parts[1]
+        if parsed.path != f"/{route}/{key}" or not PUBLIC_SLUG_RE.fullmatch(key):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
         user = find_user(self.state_dir, key)
         if not user:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
-        query = parse_qs(parsed.query, keep_blank_values=True)
+        try:
+            query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=4)
+        except ValueError:
+            self.send_error(HTTPStatus.BAD_REQUEST)
+            return
+        if any(name != "client" for name in query):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
         supplied_tokens = self._supplied_client_tokens(query)
         authorized, matched_token = authorize_subscription(user, self._client_ip(), supplied_tokens)
         if not authorized:
@@ -486,18 +577,31 @@ class App(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, "application/yaml; charset=utf-8", render_clash(self.env, user).encode())
             return
         if route == "web":
+            nonce = secrets.token_urlsafe(24)
+            content_security_policy = (
+                "default-src 'none'; "
+                f"style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; "
+                "connect-src 'none'; img-src 'none'; font-src 'none'; object-src 'none'; "
+                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            )
             self._send(
                 HTTPStatus.OK,
                 "text/html; charset=utf-8",
-                render_html(self.env, user, matched_token).encode(),
+                render_html(self.env, user, matched_token, nonce).encode(),
+                {"Content-Security-Policy": content_security_policy},
             )
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
-        parts = [p for p in self.path.split("?")[0].split("/") if p]
-        if parts == ["hy2-auth"]:
+        if len(self.path) > MAX_REQUEST_TARGET_LENGTH:
+            self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+            return
+        if self.path == "/hy2-auth":
+            if self.headers.get("Transfer-Encoding"):
+                self._send(HTTPStatus.BAD_REQUEST, "application/json; charset=utf-8", b'{"ok":false}')
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0") or "0")
             except ValueError:
@@ -509,10 +613,10 @@ class App(BaseHTTPRequestHandler):
             body = self.rfile.read(length) if length > 0 else b"{}"
             try:
                 payload = json.loads(body.decode("utf-8"))
-            except Exception:
+            except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
                 self._send(HTTPStatus.OK, "application/json; charset=utf-8", b'{"ok":false}')
                 return
-            auth = str(payload.get("auth", ""))
+            auth = payload.get("auth", "") if isinstance(payload, dict) else ""
             user = find_user_by_hy2_auth(self.state_dir, auth)
             if user:
                 body = json.dumps({"ok": True, "id": user["name"]}).encode("utf-8")
@@ -525,26 +629,45 @@ class App(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
-    def _send(self, status, content_type, body: bytes):
+    def send_response(self, code, message=None):
+        """Send status and date without disclosing the Python server banner."""
+        self.log_request(code)
+        self.send_response_only(code, message)
+        self.send_header("Date", self.date_time_string())
+
+    def send_error(self, code, message=None, explain=None):
+        body = b"not found" if int(code) == int(HTTPStatus.NOT_FOUND) else b"request rejected"
+        self._send(code, "text/plain; charset=utf-8", body)
+
+    def _send(self, status, content_type, body: bytes, extra_headers=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, *args, max_workers=64, **kwargs):
+    def __init__(self, *args, max_workers=32, **kwargs):
         self._worker_slots = threading.BoundedSemaphore(max_workers)
         super().__init__(*args, **kwargs)
 
     def get_request(self):
         request, client_address = super().get_request()
-        request.settimeout(15)
+        request.settimeout(10)
         return request, client_address
 
     def process_request(self, request, client_address):
@@ -575,6 +698,8 @@ def main():
     App.state_dir = Path(args.state_dir)
     env_file = Path(args.env_file) if args.env_file else App.state_dir / "stack.env"
     App.env = load_env(env_file)
+    if not validate_runtime_env(App.env):
+        parser.error("运行配置无效或包含不安全值")
 
     httpd = BoundedThreadingHTTPServer((args.host, args.port), App)
     httpd.serve_forever()
