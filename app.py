@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import hmac
 import html
+import ipaddress
 import json
-import os
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 
 def load_env(path: Path) -> dict:
@@ -21,10 +23,18 @@ def load_env(path: Path) -> dict:
     return env
 
 
-def find_user(state_dir: Path, key: str):
+def secure_compare(left, right) -> bool:
+    try:
+        return hmac.compare_digest(str(left), str(right))
+    except (TypeError, UnicodeError):
+        return False
+
+
+def find_user(state_dir: Path, slug: str):
+    """Return an enabled user by the unguessable public slug only."""
     data = json.loads((state_dir / "users.json").read_text())
     for user in data.get("users", []):
-        if user.get("slug") == key or user.get("name") == key:
+        if user.get("enabled", True) and secure_compare(user.get("slug", ""), slug):
             return user
     return None
 
@@ -32,9 +42,49 @@ def find_user(state_dir: Path, key: str):
 def find_user_by_hy2_auth(state_dir: Path, auth: str):
     data = json.loads((state_dir / "users.json").read_text())
     for user in data.get("users", []):
-        if user.get("enabled", True) and user.get("hy2_auth") == auth:
+        if user.get("enabled", True) and secure_compare(user.get("hy2_auth", ""), auth):
             return user
     return None
+
+
+def ip_is_allowed(address: str, networks) -> bool:
+    try:
+        candidate = ipaddress.ip_address(address)
+        if isinstance(candidate, ipaddress.IPv6Address) and candidate.ipv4_mapped:
+            candidate = candidate.ipv4_mapped
+    except ValueError:
+        return False
+
+    for value in networks if isinstance(networks, list) else []:
+        try:
+            network = ipaddress.ip_network(str(value), strict=False)
+        except ValueError:
+            continue
+        if candidate.version == network.version and candidate in network:
+            return True
+    return False
+
+
+def authorize_subscription(user: dict, client_ip: str, supplied_tokens) -> tuple[bool, str]:
+    """Authorize by a revocable client token or the user's source-IP allowlist."""
+    tokens = [str(token) for token in supplied_tokens if token]
+    clients = user.get("subscription_clients", [])
+    if isinstance(clients, list):
+        for client in clients:
+            if not isinstance(client, dict) or not client.get("enabled", True):
+                continue
+            expected = str(client.get("token", ""))
+            if not expected:
+                continue
+            for supplied in tokens:
+                if secure_compare(expected, supplied):
+                    allowed_ips = client.get("allowed_ips", [])
+                    if not allowed_ips or ip_is_allowed(client_ip, allowed_ips):
+                        return True, supplied
+
+    if ip_is_allowed(client_ip, user.get("allowed_ips", [])):
+        return True, ""
+    return False, ""
 
 
 def raw_links(env: dict, user: dict):
@@ -53,18 +103,40 @@ def raw_links(env: dict, user: dict):
     if obfs:
         hy2 += f'&obfs=salamander&obfs-password={quote(obfs)}'
     hy2 += f'#{quote(name + "-hy2")}'
-    return vless, hy2
+    anytls = (
+        f'anytls://{quote(user["anytls_password"], safe="")}@{env["PUBLIC_IP"]}:{env["ANYTLS_PORT"]}'
+        f'?security=tls&sni={quote(env["WEB_DOMAIN"])}&fp=chrome'
+        f'#{quote(name + "-anytls")}'
+    )
+    tuic = (
+        f'tuic://{quote(user["tuic_uuid"], safe="")}:{quote(user["tuic_password"], safe="")}'
+        f'@{env["PUBLIC_IP"]}:{env["TUIC_PORT"]}'
+        f'?sni={quote(env["WEB_DOMAIN"])}&alpn=h3&congestion_control=bbr'
+        f'&udp_relay_mode=native&zero_rtt_handshake=false#{quote(name + "-tuic")}'
+    )
+    naive = (
+        f'naive+https://{quote(user["naive_username"], safe="")}:'
+        f'{quote(user["naive_password"], safe="")}@{env["WEB_DOMAIN"]}:{env["NAIVE_PORT"]}'
+        f'#{quote(name + "-naive")}'
+    )
+    return vless, hy2, anytls, tuic, naive
 
 
 def render_clash(env: dict, user: dict):
-    vless, hy2 = raw_links(env, user)
-    # Conservative Mihomo YAML that keeps separate nodes.
+    # JSON strings are valid YAML scalars and prevent user-controlled YAML injection.
+    yaml_string = lambda value: json.dumps(str(value), ensure_ascii=False)
+    names = {
+        "vless": f'{user["name"]}-vless',
+        "hy2": f'{user["name"]}-hy2',
+        "anytls": f'{user["name"]}-anytls',
+        "tuic": f'{user["name"]}-tuic',
+    }
     base = f"""mixed-port: 7890
-allow-lan: true
+allow-lan: false
 mode: rule
 log-level: info
 proxies:
-  - name: "{user['name']}-vless"
+  - name: {yaml_string(names['vless'])}
     type: vless
     server: {env['PUBLIC_IP']}
     port: 443
@@ -78,7 +150,7 @@ proxies:
       short-id: {env['REALITY_SHORT_ID']}
     client-fingerprint: chrome
     flow: xtls-rprx-vision
-  - name: "{user['name']}-hy2"
+  - name: {yaml_string(names['hy2'])}
     type: hysteria2
     server: {env['PUBLIC_IP']}
     port: 443
@@ -89,35 +161,55 @@ proxies:
 """
     obfs = env.get("HY2_OBFS_PASSWORD", "").strip()
     if obfs:
-        return base + f"""    obfs: salamander
-    obfs-password: "{obfs}"
+        base += f"""    obfs: salamander
+    obfs-password: {yaml_string(obfs)}
+"""
+    return base + f"""  - name: {yaml_string(names['anytls'])}
+    type: anytls
+    server: {env['PUBLIC_IP']}
+    port: {env['ANYTLS_PORT']}
+    password: {yaml_string(user['anytls_password'])}
+    client-fingerprint: chrome
+    udp: true
+    sni: {env['WEB_DOMAIN']}
+    alpn:
+      - h2
+      - http/1.1
+    skip-cert-verify: false
+  - name: {yaml_string(names['tuic'])}
+    type: tuic
+    server: {env['PUBLIC_IP']}
+    port: {env['TUIC_PORT']}
+    uuid: {user['tuic_uuid']}
+    password: {yaml_string(user['tuic_password'])}
+    sni: {env['WEB_DOMAIN']}
+    alpn:
+      - h3
+    disable-sni: false
+    reduce-rtt: false
+    udp-relay-mode: native
+    congestion-controller: bbr
 proxy-groups:
   - name: "AUTO"
     type: select
     proxies:
-      - "{user['name']}-vless"
-      - "{user['name']}-hy2"
+      - {yaml_string(names['vless'])}
+      - {yaml_string(names['hy2'])}
+      - {yaml_string(names['anytls'])}
+      - {yaml_string(names['tuic'])}
 rules:
   - MATCH,AUTO
 """
-    return base + """proxy-groups:
-  - name: "AUTO"
-    type: select
-    proxies:
-      - "{name}-vless"
-      - "{name}-hy2"
-rules:
-  - MATCH,AUTO
-""".format(name=user["name"])
 
 
-def render_html(env: dict, user: dict):
-    vless, hy2 = raw_links(env, user)
+def render_html(env: dict, user: dict, client_token: str = ""):
+    vless, hy2, anytls, tuic, naive = raw_links(env, user)
     slug = user["slug"]
-    page_url = f"https://{env['WEB_DOMAIN']}/web/{slug}"
-    link_url = f"https://{env['WEB_DOMAIN']}/link/{slug}"
-    mihomo_url = f"https://{env['WEB_DOMAIN']}/mihomo/{slug}"
-    node_url = f"https://{env['WEB_DOMAIN']}/node/{slug}"
+    query = f"?client={quote(client_token, safe='')}" if client_token else ""
+    page_url = f"https://{env['WEB_DOMAIN']}/web/{slug}{query}"
+    link_url = f"https://{env['WEB_DOMAIN']}/link/{slug}{query}"
+    mihomo_url = f"https://{env['WEB_DOMAIN']}/mihomo/{slug}{query}"
+    node_url = f"https://{env['WEB_DOMAIN']}/node/{slug}{query}"
     safe_name = html.escape(user["name"])
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -284,6 +376,21 @@ def render_html(env: dict, user: dict):
           <button class="primary" data-copy="hy2">复制</button>
         </div>
       </div>
+      <div class="card wide">
+        <div class="card-title">AnyTLS</div>
+        <code class="url" id="anytls">{html.escape(anytls)}</code>
+        <div class="actions"><button class="primary" data-copy="anytls">复制</button></div>
+      </div>
+      <div class="card wide">
+        <div class="card-title">TUIC v5（0-RTT 已关闭）</div>
+        <code class="url" id="tuic">{html.escape(tuic)}</code>
+        <div class="actions"><button class="primary" data-copy="tuic">复制</button></div>
+      </div>
+      <div class="card wide">
+        <div class="card-title">NaiveProxy（独立客户端）</div>
+        <code class="url" id="naive">{html.escape(naive)}</code>
+        <div class="actions"><button class="primary" data-copy="naive">复制</button></div>
+      </div>
     </div>
   </main>
   <div class="toast" id="toast">已复制</div>
@@ -315,20 +422,54 @@ class App(BaseHTTPRequestHandler):
     state_dir = Path("/etc/proxy-stack")
     env = {}
 
+    def _client_ip(self) -> str:
+        peer_ip = str(self.client_address[0])
+        expected = self.env.get("INTERNAL_PROXY_TOKEN", "")
+        supplied = self.headers.get("X-Proxy-Stack-Internal", "")
+        if expected and supplied and secure_compare(expected, supplied):
+            forwarded = self.headers.get("X-Real-IP", "").strip()
+            try:
+                ipaddress.ip_address(forwarded)
+                return forwarded
+            except ValueError:
+                pass
+        return peer_ip
+
+    def _supplied_client_tokens(self, query: dict) -> list[str]:
+        tokens = query.get("client", [])
+        if len(tokens) > 1:
+            return []
+        result = [tokens[0]] if tokens else []
+        authorization = self.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            result.append(authorization[7:].strip())
+        return [token for token in result if token]
+
     def do_GET(self):
-        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        parsed = urlsplit(self.path)
+        parts = [p for p in parsed.path.split("/") if p]
         if not parts:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
         route = parts[0]
-        key = parts[1] if len(parts) > 1 else ""
-        user = find_user(self.state_dir, key) if key else None
-
-        if route == "healthz":
+        if parts == ["healthz"]:
             self._send(HTTPStatus.OK, "text/plain; charset=utf-8", b"ok")
             return
+        if len(parts) != 2 or route not in {"web", "link", "mihomo", "node"}:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        key = parts[1]
+        user = find_user(self.state_dir, key)
         if not user:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        supplied_tokens = self._supplied_client_tokens(query)
+        authorized, matched_token = authorize_subscription(user, self._client_ip(), supplied_tokens)
+        if not authorized:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
@@ -345,7 +486,11 @@ class App(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, "application/yaml; charset=utf-8", render_clash(self.env, user).encode())
             return
         if route == "web":
-            self._send(HTTPStatus.OK, "text/html; charset=utf-8", render_html(self.env, user).encode())
+            self._send(
+                HTTPStatus.OK,
+                "text/html; charset=utf-8",
+                render_html(self.env, user, matched_token).encode(),
+            )
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -353,7 +498,14 @@ class App(BaseHTTPRequestHandler):
     def do_POST(self):
         parts = [p for p in self.path.split("?")[0].split("/") if p]
         if parts == ["hy2-auth"]:
-            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                self._send(HTTPStatus.BAD_REQUEST, "application/json; charset=utf-8", b'{"ok":false}')
+                return
+            if length < 0 or length > 4096:
+                self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "application/json; charset=utf-8", b'{"ok":false}')
+                return
             body = self.rfile.read(length) if length > 0 else b"{}"
             try:
                 payload = json.loads(body.decode("utf-8"))
@@ -377,21 +529,54 @@ class App(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args, max_workers=64, **kwargs):
+        self._worker_slots = threading.BoundedSemaphore(max_workers)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        request.settimeout(15)
+        return request, client_address
+
+    def process_request(self, request, client_address):
+        if not self._worker_slots.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-dir", required=True)
+    parser.add_argument("--env-file", default="")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9080)
     args = parser.parse_args()
 
     App.state_dir = Path(args.state_dir)
-    App.env = load_env(App.state_dir / "stack.env")
+    env_file = Path(args.env_file) if args.env_file else App.state_dir / "stack.env"
+    App.env = load_env(env_file)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), App)
+    httpd = BoundedThreadingHTTPServer((args.host, args.port), App)
     httpd.serve_forever()
 
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="/etc/proxy-stack"
@@ -8,14 +9,28 @@ WEB_ROOT="/var/www/proxy-stack"
 ACME_HOME="$RUNTIME_DIR/acme.sh"
 XRAY_HOME="$RUNTIME_DIR/xray"
 BIN_DIR="$RUNTIME_DIR/bin"
+WEB_SERVICE_USER="proxy-stack-web"
+WEB_SERVICE_GROUP="proxy-stack-web"
+XRAY_SERVICE_USER="proxy-stack-xray"
+XRAY_SERVICE_GROUP="proxy-stack-xray"
+HYSTERIA_SERVICE_USER="proxy-stack-hysteria"
+HYSTERIA_SERVICE_GROUP="proxy-stack-hysteria"
+SING_BOX_SERVICE_USER="proxy-stack-sing-box"
+SING_BOX_SERVICE_GROUP="proxy-stack-sing-box"
+TLS_SERVICE_GROUP="proxy-stack-tls"
+SERVICE_TLS_DIR="$STATE_DIR/tls"
 NGINX_HTTP_CONF="/etc/nginx/conf.d/proxy-stack-http.conf"
 NGINX_STREAM_CONF="/etc/nginx/stream-conf.d/proxy-stack-stream.conf"
 NGINX_ACME_CONF="/etc/nginx/conf.d/proxy-stack-acme.conf"
+FAIL2BAN_MAIN_CONF="/etc/fail2ban/fail2ban.d/proxy-stack.local"
+FAIL2BAN_JAIL_CONF="/etc/fail2ban/jail.d/proxy-stack-sshd.local"
 SYSTEMD_DIR="/etc/systemd/system"
 APP_PORT="9080"
 WEB_TLS_PORT="9443"
-MGMT_TLS_PORT="9444"
 VLESS_INTERNAL_PORT="10443"
+ANYTLS_PORT="8443"
+TUIC_PORT="8443"
+NAIVE_PORT="8444"
 PROXY_STACK_LOG_FILE="${PROXY_STACK_LOG_FILE:-/var/log/proxy-stack.log}"
 
 log() {
@@ -125,8 +140,23 @@ validate_email() {
 is_valid_email() {
   local email="$1"
   local email_domain="${email##*@}"
-  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || return 1
+  [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$ ]] || return 1
   ! is_placeholder_domain "$email_domain"
+}
+
+validate_safe_absolute_path() {
+  local label="$1"
+  local path="$2"
+  [[ "$path" =~ ^/[A-Za-z0-9._/+:@-]+$ ]] || die "$label 必须是仅含安全字符的绝对路径：$path"
+}
+
+validate_reality_target() {
+  local target="$1"
+  local host="${target%:*}"
+  local port="${target##*:}"
+  is_valid_domain "$host" || die "--reality-target 主机名无效：$target"
+  [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) \
+    || die "--reality-target 端口无效：$target"
 }
 
 prompt_value_if_tty() {
@@ -161,7 +191,48 @@ validate_ipv4() {
 }
 
 ensure_dirs() {
-  mkdir -p "$STATE_DIR" "$RUNTIME_DIR" "$WEB_ROOT" "$BIN_DIR" /etc/nginx/stream-conf.d
+  ensure_service_account
+  install -d -m 0751 -o root -g root "$STATE_DIR"
+  install -d -m 0750 -o root -g "$TLS_SERVICE_GROUP" "$SERVICE_TLS_DIR"
+  install -d -m 0755 -o root -g root "$RUNTIME_DIR" "$BIN_DIR" "$WEB_ROOT" /etc/nginx/stream-conf.d
+}
+
+ensure_service_account() {
+  local pair user group
+  for pair in \
+    "$WEB_SERVICE_USER:$WEB_SERVICE_GROUP" \
+    "$XRAY_SERVICE_USER:$XRAY_SERVICE_GROUP" \
+    "$HYSTERIA_SERVICE_USER:$HYSTERIA_SERVICE_GROUP" \
+    "$SING_BOX_SERVICE_USER:$SING_BOX_SERVICE_GROUP"; do
+    user="${pair%%:*}"
+    group="${pair##*:}"
+    getent group "$group" >/dev/null 2>&1 || groupadd --system "$group"
+    if ! id -u "$user" >/dev/null 2>&1; then
+      useradd --system --gid "$group" --home-dir /nonexistent --shell /usr/sbin/nologin "$user"
+    fi
+  done
+  getent group "$TLS_SERVICE_GROUP" >/dev/null 2>&1 || groupadd --system "$TLS_SERVICE_GROUP"
+}
+
+secure_state_file() {
+  local path="$1"
+  local group="${2:-$WEB_SERVICE_GROUP}"
+  chown root:"$group" "$path"
+  chmod 0640 "$path"
+}
+
+secure_root_file() {
+  local path="$1"
+  chown root:root "$path"
+  chmod 0600 "$path"
+}
+
+sync_service_tls_material() {
+  load_env
+  ensure_service_account
+  install -d -m 0750 -o root -g "$TLS_SERVICE_GROUP" "$SERVICE_TLS_DIR"
+  install -m 0640 -o root -g "$TLS_SERVICE_GROUP" "$TLS_CERT_FILE" "$SERVICE_TLS_DIR/fullchain.pem"
+  install -m 0640 -o root -g "$TLS_SERVICE_GROUP" "$TLS_KEY_FILE" "$SERVICE_TLS_DIR/privkey.pem"
 }
 
 load_env() {
@@ -174,7 +245,53 @@ load_env() {
 save_env() {
   local env_file="$STATE_DIR/stack.env"
   cat >"$env_file"
-  chmod 600 "$env_file"
+  secure_root_file "$env_file"
+}
+
+ensure_env_defaults() {
+  local env_file="$STATE_DIR/stack.env"
+  local rotated_obfs rotated_short_id rotated_private rotated_public xray_out tmp_file internal_proxy_token
+  [[ -f "$env_file" ]] || die "缺少配置文件：$env_file"
+  if ! grep -q '^SECURITY_SCHEMA_VERSION=2$' "$env_file"; then
+    rotated_obfs="$(random_token 24)"
+    rotated_short_id="$(random_hex 8)"
+    rotated_private=""
+    rotated_public=""
+    if [[ -x "$BIN_DIR/xray" ]]; then
+      xray_out="$("$BIN_DIR/xray" x25519)"
+      rotated_private="$(printf '%s\n' "$xray_out" | awk 'index($0,"PrivateKey:")==1 {print $2}')"
+      rotated_public="$(printf '%s\n' "$xray_out" | awk 'index($0,"Password (PublicKey):")==1 {print $3}')"
+      [[ -n "$rotated_private" && -n "$rotated_public" ]] \
+        || die "安全迁移时生成 REALITY 密钥失败"
+    fi
+    tmp_file="$(mktemp "$STATE_DIR/.stack.env.XXXXXX")"
+    awk -v obfs="$rotated_obfs" -v short_id="$rotated_short_id" \
+      -v private_key="$rotated_private" -v public_key="$rotated_public" '
+      BEGIN { replaced_obfs = 0; replaced_short_id = 0 }
+      /^HY2_OBFS_PASSWORD=/ { print "HY2_OBFS_PASSWORD=" obfs; replaced_obfs = 1; next }
+      /^REALITY_SHORT_ID=/ { print "REALITY_SHORT_ID=" short_id; replaced_short_id = 1; next }
+      /^REALITY_PRIVATE_KEY=/ && private_key != "" { print "REALITY_PRIVATE_KEY=" private_key; next }
+      /^REALITY_PUBLIC_KEY=/ && public_key != "" { print "REALITY_PUBLIC_KEY=" public_key; next }
+      /^SECURITY_SCHEMA_VERSION=/ { next }
+      { print }
+      END {
+        if (!replaced_obfs) print "HY2_OBFS_PASSWORD=" obfs
+        if (!replaced_short_id) print "REALITY_SHORT_ID=" short_id
+        print "SECURITY_SCHEMA_VERSION=2"
+      }
+    ' "$env_file" >"$tmp_file"
+    mv "$tmp_file" "$env_file"
+    log "已执行安全迁移：轮换共享 Hysteria2 混淆密钥与 REALITY 密钥标识"
+  fi
+  grep -q '^ANYTLS_PORT=' "$env_file" || printf 'ANYTLS_PORT=%s\n' "$ANYTLS_PORT" >>"$env_file"
+  grep -q '^TUIC_PORT=' "$env_file" || printf 'TUIC_PORT=%s\n' "$TUIC_PORT" >>"$env_file"
+  grep -q '^NAIVE_PORT=' "$env_file" || printf 'NAIVE_PORT=%s\n' "$NAIVE_PORT" >>"$env_file"
+  if ! grep -Eq '^INTERNAL_PROXY_TOKEN=[A-Za-z0-9_-]{40,}$' "$env_file"; then
+    internal_proxy_token="$(random_token 32)"
+    printf 'INTERNAL_PROXY_TOKEN=%s\n' "$internal_proxy_token" >>"$env_file"
+  fi
+  secure_root_file "$env_file"
+  load_env
 }
 
 json_get() {
@@ -186,11 +303,15 @@ json_get() {
 random_slug() {
   python3 - <<'PY'
 import secrets
-import string
-
-alphabet = string.ascii_letters + string.digits
-print("".join(secrets.choice(alphabet) for _ in range(10)))
+print(secrets.token_urlsafe(24))
 PY
+}
+
+validate_user_name() {
+  local label="$1"
+  local name="$2"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+    || die "$label 仅允许 1-64 位英文字母、数字、点、下划线和连字符，且必须以字母或数字开头"
 }
 
 random_hex() {
@@ -223,10 +344,15 @@ resolve_domain_ipv4s() {
   getent ahostsv4 "$domain" | awk '{print $1}' | sort -u
 }
 
+resolve_domain_ipv6s() {
+  local domain="$1"
+  getent ahostsv6 "$domain" | awk '{print $1}' | grep -F ':' | sort -u
+}
+
 preflight_acme_dns() {
   local public_ip="$1"
   shift
-  local domain ips bad_ips flat_ips
+  local domain ips bad_ips flat_ips ipv6s
   for domain in "$@"; do
     ips="$(resolve_domain_ipv4s "$domain" || true)"
     if [[ -z "$ips" ]]; then
@@ -237,6 +363,9 @@ preflight_acme_dns() {
       flat_ips="$(printf '%s' "$ips" | paste -sd ',' -)"
       die "$domain 当前解析到 $flat_ips。申请 Let's Encrypt 证书前，所有 IPv4 A 记录都必须指向本机公网 IP $public_ip。"
     fi
+    ipv6s="$(resolve_domain_ipv6s "$domain" || true)"
+    [[ -z "$ipv6s" ]] \
+      || die "$domain 存在 IPv6 AAAA 记录，但当前栈只交付 IPv4 地址。请先删除 AAAA 记录，避免证书验证和客户端连接到错误主机。"
   done
 }
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 REPO_URL="${PROXY_STACK_REPO_URL:-https://github.com/HCRXchenghong/proxy-stack}"
 BRANCH="${PROXY_STACK_BRANCH:-main}"
@@ -55,25 +56,25 @@ validate_domain_arg() {
 validate_email_arg() {
   local email="$1"
   local email_domain="${email##*@}"
-  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "--cert-email 必须是有效邮箱地址"
+  [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$ ]] || die "--cert-email 必须是有效邮箱地址"
   ! is_placeholder_domain "$email_domain" || die "--cert-email 不能使用示例/保留域名邮箱：$email"
 }
 
 is_valid_cert_email() {
   local email="$1"
   local email_domain="${email##*@}"
-  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || return 1
+  [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$ ]] || return 1
   ! is_placeholder_domain "$email_domain"
 }
 
 usage() {
   cat <<'EOF'
 用法：
-  sudo bash deploy.sh [--web-domain <域名>] [--management-domain <域名>] [--cert-email <邮箱>]
+  sudo bash deploy.sh [--web-domain <域名>] [--cert-email <邮箱>]
 
 选项：
   --web-domain <域名>            用户交付页/订阅使用的公网域名。
-  --management-domain <域名>     管理域名，会转发到 127.0.0.1:8317。
+  --management-domain <域名>     已弃用兼容参数，不签证书、不开放公网管理入口。
   --cert-email <邮箱>            Let's Encrypt 注册邮箱；交互式终端中省略时会提示输入。
   --tls-cert-file <路径>         已有 TLS fullchain 证书路径。
   --tls-key-file <路径>          已有 TLS 私钥路径。
@@ -202,6 +203,12 @@ download_payload() {
   tar -xzf "$archive" -C "$tmp"
   src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   [[ -n "$src" ]] || die "解压仓库压缩包失败"
+  [[ -f "$src/proxy-stack.sh" && -f "$src/app.py" && -f "$src/lib/common.sh" && -f "$src/lib/render.sh" ]] \
+    || die "项目下载包缺少必要文件"
+  bash -n "$src/proxy-stack.sh" "$src/lib/common.sh" "$src/lib/render.sh"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$src/app.py"
+  fi
   mkdir -p "$dst"
   cp -a "$src/." "$dst/"
   chmod 0755 "$dst/proxy-stack.sh"
@@ -222,14 +229,14 @@ prepare_payload() {
 
 validate_inputs() {
   prompt_if_tty WEB_DOMAIN "请输入用户交付页/订阅域名"
-  prompt_if_tty MANAGEMENT_DOMAIN "请输入管理域名"
   prompt_cert_email_if_needed
 
   [[ -n "$WEB_DOMAIN" ]] || die "必须提供 --web-domain"
-  [[ -n "$MANAGEMENT_DOMAIN" ]] || die "必须提供 --management-domain"
   validate_domain_arg "--web-domain" "$WEB_DOMAIN"
-  validate_domain_arg "--management-domain" "$MANAGEMENT_DOMAIN"
-  [[ "$WEB_DOMAIN" != "$MANAGEMENT_DOMAIN" ]] || die "用户域名和管理域名不能相同"
+  if [[ -n "$MANAGEMENT_DOMAIN" ]]; then
+    validate_domain_arg "--management-domain" "$MANAGEMENT_DOMAIN"
+    [[ "$WEB_DOMAIN" != "$MANAGEMENT_DOMAIN" ]] || die "用户域名和管理域名不能相同"
+  fi
   [[ "$INSTALL_DIR" == /* ]] || die "--install-dir 必须是绝对路径"
   if [[ -n "$TLS_CERT_FILE" || -n "$TLS_KEY_FILE" ]]; then
     [[ -n "$TLS_CERT_FILE" && -n "$TLS_KEY_FILE" ]] || die "请同时提供 --tls-cert-file 和 --tls-key-file"
@@ -246,7 +253,7 @@ confirm() {
   printf '\n'
   log "即将使用以下配置部署："
   printf '  用户域名：  %s\n' "$WEB_DOMAIN"
-  printf '  管理域名：  %s\n' "$MANAGEMENT_DOMAIN"
+  printf '  管理入口：  仅 SSH（不开放公网面板）\n'
   printf '  证书邮箱：  %s\n' "${CERT_EMAIL:-使用已有证书/私钥}"
   printf '  安装目录：  %s\n' "$INSTALL_DIR"
   printf '\n'
@@ -259,8 +266,8 @@ run_install() {
   args=(
     "$INSTALL_DIR/proxy-stack.sh" install
     --web-domain "$WEB_DOMAIN"
-    --management-domain "$MANAGEMENT_DOMAIN"
   )
+  [[ -n "$MANAGEMENT_DOMAIN" ]] && args+=(--management-domain "$MANAGEMENT_DOMAIN")
   [[ -n "$CERT_EMAIL" ]] && args+=(--cert-email "$CERT_EMAIL")
   [[ -n "$TLS_CERT_FILE" ]] && args+=(--tls-cert-file "$TLS_CERT_FILE")
   [[ -n "$TLS_KEY_FILE" ]] && args+=(--tls-key-file "$TLS_KEY_FILE")

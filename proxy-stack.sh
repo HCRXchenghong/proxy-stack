@@ -10,6 +10,20 @@ source "$SCRIPT_DIR/lib/render.sh"
 PROJECT_REPO_URL="${PROXY_STACK_REPO_URL:-https://github.com/HCRXchenghong/proxy-stack}"
 PROJECT_BRANCH="${PROXY_STACK_BRANCH:-main}"
 PROJECT_VERSION_FILE="$SCRIPT_DIR/VERSION"
+XRAY_VERSION="v26.3.27"
+XRAY_SHA256="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+HYSTERIA_VERSION="app/v2.10.0"
+HYSTERIA_SHA256="04f7804159ef1d798de12a817d73aab4b9040ebe45fc62e223000c5c59e987fe"
+SING_BOX_VERSION="v1.13.14"
+SING_BOX_SHA256="f48703461a15476951ac4967cdad339d986f4b8096b4eb3ff0829a500502d697"
+
+verify_sha256() {
+  local file="$1"
+  local expected="$2"
+  local actual
+  actual="$(sha256sum "$file" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || die "下载文件 SHA-256 校验失败：$file"
+}
 
 usage() {
   cat <<'EOF'
@@ -27,14 +41,25 @@ usage() {
   ./proxy-stack.sh user list
   ./proxy-stack.sh user show <用户名或slug>
   ./proxy-stack.sh user share <用户名或slug>
+  ./proxy-stack.sh user client-add <用户名或slug> <设备名> [IP/CIDR]
+  ./proxy-stack.sh user client-del <用户名或slug> <设备名>
+  ./proxy-stack.sh user client-allow-ip <用户名或slug> <设备名> <IP/CIDR>
+  ./proxy-stack.sh user client-deny-ip <用户名或slug> <设备名> <IP/CIDR>
+  ./proxy-stack.sh user allow-ip <用户名或slug> <IP/CIDR>
+  ./proxy-stack.sh user deny-ip <用户名或slug> <IP/CIDR>
+  ./proxy-stack.sh user access <用户名或slug>
   ./proxy-stack.sh user export [csv|json|text] [路径]
+  ./proxy-stack.sh security status
+  ./proxy-stack.sh security ban <IP>
+  ./proxy-stack.sh security unban <IP>
+  ./proxy-stack.sh security apply
   ./proxy-stack.sh menu
   ./proxy-stack.sh uninstall-3xui
   ./proxy-stack.sh package
 
 安装选项：
   --web-domain <域名>            用户交付页/订阅使用的公网域名。
-  --management-domain <域名>     管理域名，会转发到 127.0.0.1:8317。
+  --management-domain <域名>     已弃用兼容参数，不签证书、不开放公网管理入口。
   --cert-email <邮箱>            Let's Encrypt 注册邮箱；交互式终端中省略时会提示输入。
   --tls-cert-file <路径>         已有 TLS fullchain 证书路径。
   --tls-key-file <路径>          已有 TLS 私钥路径。
@@ -45,43 +70,90 @@ EOF
 }
 
 download_xray() {
-  require_cmd curl jq unzip
-  local api tag url zip tmp
-  api='https://api.github.com/repos/XTLS/Xray-core/releases/latest'
-  tag="$(curl -fsSL "$api" | jq -r '.tag_name')"
-  url="$(curl -fsSL "$api" | jq -r '.assets[] | select(.name=="Xray-linux-64.zip") | .browser_download_url')"
-  [[ -n "$tag" && -n "$url" ]] || die "无法解析最新版 Xray 下载地址"
+  require_cmd curl sha256sum unzip
+  local url zip tmp
+  url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
   tmp="$(mktemp -d)"
   zip="$tmp/xray.zip"
   curl -fsSL "$url" -o "$zip"
+  verify_sha256 "$zip" "$XRAY_SHA256"
   unzip -qo "$zip" -d "$tmp/unpack"
   install -m 0755 "$tmp/unpack/xray" "${BIN_DIR}/xray"
   rm -rf "$tmp"
-  log "已安装 Xray ${tag}"
+  log "已安装并校验 Xray ${XRAY_VERSION}"
 }
 
 download_hysteria() {
-  require_cmd curl jq
-  local api tag url tmp
-  api='https://api.github.com/repos/apernet/hysteria/releases/latest'
-  tag="$(curl -fsSL "$api" | jq -r '.tag_name')"
-  url="$(curl -fsSL "$api" | jq -r '.assets[] | select(.name=="hysteria-linux-amd64") | .browser_download_url')"
-  [[ -n "$tag" && -n "$url" ]] || die "无法解析最新版 Hysteria 下载地址"
+  require_cmd curl sha256sum
+  local url tmp
+  url="https://github.com/apernet/hysteria/releases/download/${HYSTERIA_VERSION}/hysteria-linux-amd64"
   tmp="$(mktemp)"
   curl -fsSL "$url" -o "$tmp"
+  verify_sha256 "$tmp" "$HYSTERIA_SHA256"
   install -m 0755 "$tmp" "${BIN_DIR}/hysteria"
   rm -f "$tmp"
-  log "已安装 Hysteria ${tag}"
+  log "已安装并校验 Hysteria ${HYSTERIA_VERSION}"
+}
+
+download_sing_box() {
+  require_cmd curl sha256sum tar
+  local version url archive tmp binary
+  version="${SING_BOX_VERSION#v}"
+  url="https://github.com/SagerNet/sing-box/releases/download/${SING_BOX_VERSION}/sing-box-${version}-linux-amd64.tar.gz"
+  tmp="$(mktemp -d)"
+  archive="$tmp/sing-box.tar.gz"
+  curl -fsSL "$url" -o "$archive"
+  verify_sha256 "$archive" "$SING_BOX_SHA256"
+  tar -xzf "$archive" -C "$tmp"
+  binary="$(find "$tmp" -type f -name sing-box -perm -0100 | head -n 1)"
+  [[ -n "$binary" ]] || die "sing-box 安装包中未找到可执行文件"
+  install -m 0755 "$binary" "${BIN_DIR}/sing-box"
+  rm -rf "$tmp"
+  log "已安装并校验 sing-box ${SING_BOX_VERSION}"
+}
+
+ensure_proxy_binaries() {
+  [[ -x "$BIN_DIR/xray" ]] || download_xray
+  [[ -x "$BIN_DIR/hysteria" ]] || download_hysteria
+  [[ -x "$BIN_DIR/sing-box" ]] || download_sing_box
+}
+
+install_pinned_proxy_binaries() {
+  download_xray
+  download_hysteria
+  download_sing_box
 }
 
 install_system_packages() {
   quiet_cmd "更新系统软件源" apt-get update
-  quiet_cmd "安装系统依赖" env DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip nginx libnginx-mod-stream certbot python3-certbot-nginx python3
+  quiet_cmd "安装系统依赖" env DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip nginx libnginx-mod-stream certbot python3-certbot-nginx python3 fail2ban
+}
+
+install_fail2ban_if_needed() {
+  command -v fail2ban-client >/dev/null 2>&1 && return 0
+  require_cmd apt-get
+  quiet_cmd "更新 Fail2ban 软件源" apt-get update
+  quiet_cmd "安装 Fail2ban" env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban
+}
+
+validate_tls_material() {
+  local cert="$1" key="$2" web_domain="$3"
+  local cert_pub key_pub
+  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || die "TLS 证书无法解析：$cert"
+  openssl pkey -in "$key" -noout >/dev/null 2>&1 || die "TLS 私钥无法解析：$key"
+  openssl x509 -in "$cert" -noout -checkend 604800 >/dev/null 2>&1 \
+    || die "TLS 证书将在 7 天内过期或已经过期：$cert"
+  openssl x509 -in "$cert" -noout -checkhost "$web_domain" >/dev/null 2>&1 \
+    || die "TLS 证书不覆盖用户域名：$web_domain"
+  cert_pub="$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum | awk '{print $1}')"
+  key_pub="$(openssl pkey -in "$key" -pubout -outform DER | sha256sum | awk '{print $1}')"
+  [[ "$cert_pub" == "$key_pub" ]] || die "TLS 证书与私钥不匹配"
 }
 
 issue_cert_if_needed() {
-  local cert="$1" key="$2" email="$3" web_domain="$4" mgmt_domain="$5"
+  local cert="$1" key="$2" email="$3" web_domain="$4"
   if [[ -f "$cert" && -f "$key" ]]; then
+    validate_tls_material "$cert" "$key" "$web_domain"
     log "复用已有 TLS 证书和私钥"
     return 0
   fi
@@ -90,23 +162,26 @@ issue_cert_if_needed() {
   mkdir -p "$WEB_ROOT/.well-known/acme-challenge"
   write_nginx_acme_conf
   reload_nginx
-  log "正在为 ${web_domain} 和 ${mgmt_domain} 申请 Let's Encrypt 证书"
-  if ! certbot certonly --webroot -w "$WEB_ROOT" \
-    -d "$web_domain" -d "$mgmt_domain" \
+  log "正在为 ${web_domain} 申请 Let's Encrypt 证书"
+  if ! (umask 022; certbot certonly --webroot -w "$WEB_ROOT" \
+    -d "$web_domain" \
     --cert-name "$web_domain" \
     --preferred-challenges http \
-    --agree-tos --no-eff-email --non-interactive --expand -m "$email"; then
-    die "Let's Encrypt 证书申请失败。请确认两个域名都解析到本机、TCP 80 已放行、Cloudflare 代理云朵已关闭，并且 $email 是真实邮箱。详情见：/var/log/letsencrypt/letsencrypt.log"
+    --agree-tos --no-eff-email --non-interactive --expand -m "$email"); then
+    die "Let's Encrypt 证书申请失败。请确认用户域名解析到本机、TCP 80 已放行、Cloudflare 代理云朵已关闭，并且 $email 是真实邮箱。详情见：/var/log/letsencrypt/letsencrypt.log"
   fi
+  validate_tls_material "$cert" "$key" "$web_domain"
 }
 
 generate_env_file() {
   local web_domain="$1" mgmt_domain="$2" cert_email="$3" tls_cert="$4" tls_key="$5" public_ip="$6" reality_target="$7" reality_sni="$8"
-  local private public short obfs out
+  local private public short obfs out security_schema internal_proxy_token
   private=""
   public=""
   short=""
   obfs=""
+  internal_proxy_token=""
+  security_schema="2"
   if [[ -f "$STATE_DIR/stack.env" ]]; then
     # shellcheck disable=SC1090
     source "$STATE_DIR/stack.env"
@@ -114,6 +189,8 @@ generate_env_file() {
     public="${REALITY_PUBLIC_KEY:-}"
     short="${REALITY_SHORT_ID:-}"
     obfs="${HY2_OBFS_PASSWORD:-}"
+    internal_proxy_token="${INTERNAL_PROXY_TOKEN:-}"
+    security_schema="${SECURITY_SCHEMA_VERSION:-0}"
   fi
   if [[ -z "$private" || -z "$public" ]]; then
     out="$("${BIN_DIR}/xray" x25519)"
@@ -121,8 +198,9 @@ generate_env_file() {
     public="$(printf '%s\n' "$out" | awk 'index($0,"Password (PublicKey):")==1 {print $3}')"
     [[ -n "$private" && -n "$public" ]] || die "生成 REALITY x25519 密钥对失败"
   fi
-  [[ -n "$short" ]] || short="$(random_hex 4)"
-  [[ -n "$obfs" ]] || obfs="$(random_token 12)"
+  [[ -n "$short" ]] || short="$(random_hex 8)"
+  [[ -n "$obfs" ]] || obfs="$(random_token 24)"
+  [[ "$internal_proxy_token" =~ ^[A-Za-z0-9_-]{40,}$ ]] || internal_proxy_token="$(random_token 32)"
   save_env <<EOF
 WEB_DOMAIN=${web_domain}
 MANAGEMENT_DOMAIN=${mgmt_domain}
@@ -139,7 +217,11 @@ HY2_OBFS_PASSWORD=${obfs}
 VLESS_INTERNAL_PORT=${VLESS_INTERNAL_PORT}
 APP_PORT=${APP_PORT}
 WEB_TLS_PORT=${WEB_TLS_PORT}
-MGMT_TLS_PORT=${MGMT_TLS_PORT}
+ANYTLS_PORT=${ANYTLS_PORT}
+TUIC_PORT=${TUIC_PORT}
+NAIVE_PORT=${NAIVE_PORT}
+INTERNAL_PROXY_TOKEN=${internal_proxy_token}
+SECURITY_SCHEMA_VERSION=${security_schema}
 EOF
 }
 
@@ -162,15 +244,18 @@ install_stack() {
     esac
   done
   [[ -n "$web_domain" ]] || die "必须提供 --web-domain"
-  [[ -n "$mgmt_domain" ]] || die "必须提供 --management-domain"
   validate_domain "--web-domain" "$web_domain"
-  validate_domain "--management-domain" "$mgmt_domain"
-  [[ "$web_domain" != "$mgmt_domain" ]] || die "用户域名和管理域名不能相同"
+  if [[ -n "$mgmt_domain" ]]; then
+    validate_domain "--management-domain" "$mgmt_domain"
+    [[ "$web_domain" != "$mgmt_domain" ]] || die "用户域名和管理域名不能相同"
+  fi
   if [[ -n "$tls_cert" || -n "$tls_key" ]]; then
     using_existing_tls=1
     [[ -n "$tls_cert" && -n "$tls_key" ]] || die "请同时提供 --tls-cert-file 和 --tls-key-file"
     [[ -f "$tls_cert" ]] || die "TLS 证书文件不存在：$tls_cert"
     [[ -f "$tls_key" ]] || die "TLS 私钥文件不存在：$tls_key"
+    validate_safe_absolute_path "--tls-cert-file" "$tls_cert"
+    validate_safe_absolute_path "--tls-key-file" "$tls_key"
   else
     while ! is_valid_email "$cert_email"; do
       if [[ -n "$cert_email" ]]; then
@@ -183,22 +268,27 @@ install_stack() {
     [[ -n "$cert_email" ]] || die "未提供 TLS 证书/私钥时必须提供 --cert-email"
     validate_email "--cert-email" "$cert_email"
   fi
+  [[ -n "$reality_target" ]] || reality_target="www.amazon.com:443"
+  [[ -n "$reality_sni" ]] || reality_sni="www.amazon.com"
+  validate_reality_target "$reality_target"
+  validate_domain "--reality-sni" "$reality_sni"
+  [[ "${reality_target%:*}" == "$reality_sni" ]] \
+    || die "--reality-target 主机名必须与 --reality-sni 一致"
   ensure_dirs
   if [[ -z "$public_ip" ]]; then
     public_ip="$(public_ipv4)" || die "自动探测公网 IPv4 失败，请传入 --public-ip <ip>"
   fi
   validate_ipv4 "--public-ip" "$public_ip"
   if [[ "$using_existing_tls" -eq 0 ]]; then
-    preflight_acme_dns "$public_ip" "$web_domain" "$mgmt_domain"
+    preflight_acme_dns "$public_ip" "$web_domain"
   fi
-  progress_step 1 10 "安装依赖" install_system_packages
-  require_cmd jq unzip nginx certbot
-  progress_step 2 10 "配置 nginx" ensure_nginx_stream_include
-  progress_step 3 10 "启动 nginx" systemctl enable --now nginx
-  progress_step 4 10 "安装 Xray" download_xray
-  progress_step 5 10 "安装 Hysteria2" download_hysteria
-  [[ -n "$reality_target" ]] || reality_target="www.amazon.com:443"
-  [[ -n "$reality_sni" ]] || reality_sni="www.amazon.com"
+  progress_step 1 11 "安装依赖" install_system_packages
+  require_cmd jq unzip nginx certbot fail2ban-client
+  progress_step 2 11 "配置 nginx" ensure_nginx_stream_include
+  progress_step 3 11 "启动 nginx" systemctl enable --now nginx
+  progress_step 4 11 "安装 Xray" download_xray
+  progress_step 5 11 "安装 Hysteria2" download_hysteria
+  progress_step 6 11 "安装 sing-box" download_sing_box
   if [[ -z "$tls_cert" || -z "$tls_key" ]]; then
     tls_cert="/etc/letsencrypt/live/${web_domain}/fullchain.pem"
     tls_key="/etc/letsencrypt/live/${web_domain}/privkey.pem"
@@ -207,12 +297,12 @@ install_stack() {
   write_users_json
   disable_legacy_hcrx_conf
   load_env
-  progress_step 6 10 "申请 SSL" issue_cert_if_needed "$TLS_CERT_FILE" "$TLS_KEY_FILE" "$CERT_EMAIL" "$WEB_DOMAIN" "$MANAGEMENT_DOMAIN"
-  progress_step 7 10 "启用续签" ensure_certbot_auto_renewal
-  progress_step 8 10 "生成配置" render_stack
-  progress_step 9 10 "启动服务" systemctl enable --now proxy-stack-xray proxy-stack-hysteria proxy-stack-web
+  progress_step 7 11 "申请 SSL" issue_cert_if_needed "$TLS_CERT_FILE" "$TLS_KEY_FILE" "$CERT_EMAIL" "$WEB_DOMAIN"
+  progress_step 8 11 "启用续签" ensure_certbot_auto_renewal
+  progress_step 9 11 "生成配置" render_stack
+  progress_step 10 11 "启动服务" systemctl enable --now proxy-stack-xray proxy-stack-hysteria proxy-stack-sing-box proxy-stack-web
   reload_nginx
-  progress_step 10 10 "验证服务" verify_stack
+  progress_step 11 11 "验证服务" verify_stack
   write_runtime_info
   install_launcher
   log "安装完成"
@@ -221,12 +311,29 @@ install_stack() {
 
 render_stack() {
   require_root
+  install_fail2ban_if_needed
+  ensure_dirs
+  ensure_proxy_binaries
+  ensure_env_defaults
+  write_users_json
+  ensure_user_protocol_credentials
+  sync_service_tls_material
   write_xray_config
   write_hysteria_config
+  write_sing_box_config
+  write_public_env
   write_web_app
   write_nginx_http_conf
   write_nginx_stream_conf
+  write_fail2ban_config
   write_systemd_units
+  write_certbot_hook
+  quiet_cmd "检查 Fail2ban 配置" fail2ban-client -t
+  quiet_cmd "启用 SSH 防护" systemctl enable --now fail2ban
+  quiet_cmd "重载 SSH 防护" systemctl restart fail2ban
+  if systemctl is-active --quiet proxy-stack-xray 2>/dev/null; then
+    quiet_cmd "启用 sing-box 服务" systemctl enable --now proxy-stack-sing-box
+  fi
   log "配置渲染完成"
 }
 
@@ -234,12 +341,17 @@ verify_stack() {
   require_root
   load_env
   quiet_cmd "检测 Xray 配置" "${BIN_DIR}/xray" run -test -c "${STATE_DIR}/xray.json"
+  quiet_cmd "检测 sing-box 配置" "${BIN_DIR}/sing-box" check -c "${STATE_DIR}/sing-box.json"
   quiet_cmd "检测 Web 服务" curl -fsS "http://127.0.0.1:${APP_PORT}/healthz"
   quiet_cmd "检测 nginx 配置" nginx -t
+  quiet_cmd "检测 HTTPS/SNI 分流" curl -fsS --noproxy '*' --connect-timeout 5 --resolve "${WEB_DOMAIN}:443:127.0.0.1" "https://${WEB_DOMAIN}/healthz"
+  validate_tls_material "$TLS_CERT_FILE" "$TLS_KEY_FILE" "$WEB_DOMAIN"
   quiet_cmd "检查 Xray 服务" systemctl is-active --quiet proxy-stack-xray
   quiet_cmd "检查 Hysteria2 服务" systemctl is-active --quiet proxy-stack-hysteria
+  quiet_cmd "检查 sing-box 服务" systemctl is-active --quiet proxy-stack-sing-box
   quiet_cmd "检查 Web 服务状态" systemctl is-active --quiet proxy-stack-web
   quiet_cmd "检查 nginx 服务" systemctl is-active --quiet nginx
+  quiet_cmd "检查 Fail2ban 服务" systemctl is-active --quiet fail2ban
   log "验证通过"
 }
 
@@ -249,6 +361,7 @@ wait_stack_ready() {
   for i in $(seq 1 "$tries"); do
     if systemctl is-active --quiet proxy-stack-xray \
       && systemctl is-active --quiet proxy-stack-hysteria \
+      && systemctl is-active --quiet proxy-stack-sing-box \
       && systemctl is-active --quiet proxy-stack-web \
       && curl -fsS "http://127.0.0.1:${APP_PORT}/healthz" >/dev/null 2>&1; then
       return 0
@@ -259,7 +372,7 @@ wait_stack_ready() {
 }
 
 reload_stack_services() {
-  quiet_cmd "重启代理服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web
+  quiet_cmd "重启代理服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-sing-box proxy-stack-web
   wait_stack_ready
 }
 
@@ -272,7 +385,7 @@ write_runtime_info() {
     printf '项目目录：/root/proxy-stack\n'
     printf '项目压缩包：/root/proxy-stack-project.tar.gz\n'
     printf '用户域名：%s\n' "$WEB_DOMAIN"
-    printf '管理域名：%s\n' "$MANAGEMENT_DOMAIN"
+    printf '管理入口：仅 SSH\n'
     printf '公网 IP：%s\n' "$PUBLIC_IP"
     printf '用户列表命令：bash /root/proxy-stack/proxy-stack.sh user list\n'
     printf '管理菜单命令：seroncheng\n'
@@ -428,13 +541,24 @@ check_project_update() {
 download_project_payload() {
   local dst="$1"
   local tarball_url="$2"
-  local tmp archive src
+  local expected_sha256="$3"
+  local expected_version="$4"
+  local tmp archive src archive_sha version
   tmp="$(mktemp -d)"
   archive="$tmp/proxy-stack.tar.gz"
   curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$tarball_url" -o "$archive"
+  archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
+  [[ "$archive_sha" == "$expected_sha256" ]] || die "更新包 SHA-256 校验失败，已拒绝覆盖当前版本"
   tar -xzf "$archive" -C "$tmp"
   src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   [[ -n "$src" ]] || die "解压更新包失败"
+  [[ -f "$src/proxy-stack.sh" && -f "$src/deploy.sh" && -f "$src/app.py" \
+      && -f "$src/lib/common.sh" && -f "$src/lib/render.sh" && -f "$src/VERSION" ]] \
+    || die "更新包缺少必要文件"
+  bash -n "$src/proxy-stack.sh" "$src/deploy.sh" "$src/lib/common.sh" "$src/lib/render.sh"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$src/app.py"
+  version="$(head -n 1 "$src/VERSION" | tr -d '[:space:]')"
+  [[ "$version" == "$expected_version" ]] || die "更新包版本与远程版本不一致：$version != $expected_version"
   mkdir -p "$dst"
   cp -a "$src/." "$dst/"
   chmod 0755 "$dst/proxy-stack.sh"
@@ -446,6 +570,7 @@ update_project() {
   require_root
   require_cmd curl tar systemctl python3
   local local_version remote_source remote_version remote_ref remote_tarball compare_result
+  local expected_sha256="${PROXY_STACK_UPDATE_SHA256:-}"
   local_version="$(local_project_version)"
   read -r remote_source remote_version remote_ref remote_tarball < <(remote_project_info) || die "检测远程版本失败，请检查网络或仓库地址"
   [[ -n "$remote_version" && -n "$remote_tarball" ]] || die "远程版本信息不完整，无法更新"
@@ -460,13 +585,18 @@ update_project() {
     return 0
   fi
 
+  [[ "$expected_sha256" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "安全更新需要先从可信渠道取得发布包 SHA-256，并设置 PROXY_STACK_UPDATE_SHA256"
+
   log "开始更新：${local_version} -> ${remote_version}（$(remote_source_label "$remote_source")：${remote_ref}）"
-  progress_step 1 6 "下载更新" download_project_payload "$SCRIPT_DIR" "$remote_tarball"
-  progress_step 2 6 "更新入口" install_launcher
-  progress_step 3 6 "续签配置" ensure_certbot_auto_renewal
-  progress_step 4 6 "生成配置" bash "$SCRIPT_DIR/proxy-stack.sh" render
-  progress_step 5 6 "重启服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
-  progress_step 6 6 "验证服务" bash "$SCRIPT_DIR/proxy-stack.sh" verify
+  progress_step 1 8 "下载并校验更新" download_project_payload "$SCRIPT_DIR" "$remote_tarball" "${expected_sha256,,}" "$remote_version"
+  progress_step 2 8 "安装 SSH 防护" install_fail2ban_if_needed
+  progress_step 3 8 "更新代理内核" bash "$SCRIPT_DIR/proxy-stack.sh" install-binaries
+  progress_step 4 8 "更新入口" install_launcher
+  progress_step 5 8 "续签配置" ensure_certbot_auto_renewal
+  progress_step 6 8 "生成配置" bash "$SCRIPT_DIR/proxy-stack.sh" render
+  progress_step 7 8 "重启服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-sing-box proxy-stack-web nginx
+  progress_step 8 8 "验证服务" bash "$SCRIPT_DIR/proxy-stack.sh" verify
   log "更新完成，当前版本：${remote_version}"
 }
 
@@ -493,6 +623,13 @@ pause_menu() {
   read_menu_input _ "按回车继续..."
 }
 
+confirm_menu_action() {
+  local prompt="$1"
+  local answer
+  read_menu_input answer "${prompt}（输入“确认”继续）："
+  [[ "$answer" == "确认" ]]
+}
+
 run_menu_command() {
   set +e
   "$@"
@@ -510,7 +647,7 @@ menu_header() {
 
 ========== SeronCheng ==========
 用户：${WEB_DOMAIN}
-管理：${MANAGEMENT_DOMAIN}
+管理：仅 SSH
 IP：${PUBLIC_IP}
 版本：$(local_project_version)
 入口：seroncheng
@@ -521,9 +658,24 @@ EOF
 show_service_status() {
   local unit active enabled
   printf '\n%-28s %-10s %-10s\n' "服务" "状态" "自启"
-  for unit in proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx certbot.timer; do
+  for unit in proxy-stack-xray proxy-stack-hysteria proxy-stack-sing-box proxy-stack-web nginx fail2ban certbot.timer; do
     active="$(systemctl is-active "$unit" 2>/dev/null || true)"
     enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    case "$active" in
+      active) active="运行中" ;;
+      inactive) active="未运行" ;;
+      failed) active="故障" ;;
+      activating) active="启动中" ;;
+      deactivating) active="停止中" ;;
+      *) active="${active:-未知}" ;;
+    esac
+    case "$enabled" in
+      enabled) enabled="已启用" ;;
+      disabled) enabled="未启用" ;;
+      static) enabled="静态" ;;
+      indirect) enabled="间接" ;;
+      *) enabled="${enabled:-未知}" ;;
+    esac
     printf '%-28s %-10s %-10s\n' "$unit" "${active:-unknown}" "${enabled:-unknown}"
   done
 }
@@ -556,6 +708,162 @@ run_certbot_dry_run() {
   progress_step 2 2 "续签测试" certbot renew --dry-run
 }
 
+subscription_access_menu() {
+  local choice key client_name network
+  while true; do
+    cat <<'EOF'
+
+========== 订阅访问控制 ==========
+通过条件：有效设备令牌 或 用户 IP/CIDR 白名单
+最高安全：每台设备使用独立令牌，并绑定该设备出口 IP
+-------------------------------------
+1) 查看用户访问权限和订阅地址
+2) 新增允许的设备
+3) 撤销已允许的设备
+4) 给设备令牌绑定 IP/CIDR
+5) 解除设备令牌的 IP/CIDR
+6) 添加用户 IP/CIDR 白名单
+7) 删除用户 IP/CIDR 白名单
+8) 显示用户全部分享信息
+9) 查看可配置的用户列表
+0) 返回主菜单
+EOF
+    read_menu_input choice "请选择："
+    case "$choice" in
+      1)
+        read_menu_input key "用户名或 slug："
+        [[ -n "$key" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user access "$key"
+        pause_menu
+        ;;
+      2)
+        read_menu_input key "用户名或 slug："
+        read_menu_input client_name "设备名（例如 phone）："
+        read_menu_input network "绑定 IP/CIDR（留空表示不绑定）："
+        if [[ -n "$key" && -n "$client_name" ]]; then
+          run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user client-add "$key" "$client_name" "$network"
+        else
+          log "用户和设备名不能为空"
+        fi
+        pause_menu
+        ;;
+      3)
+        read_menu_input key "用户名或 slug："
+        read_menu_input client_name "要撤销的设备名："
+        if [[ -n "$key" && -n "$client_name" ]] \
+          && confirm_menu_action "确定撤销设备 ${client_name} 吗？"; then
+          run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user client-del "$key" "$client_name"
+        else
+          log "已取消撤销"
+        fi
+        pause_menu
+        ;;
+      4)
+        read_menu_input key "用户名或 slug："
+        read_menu_input client_name "设备名："
+        read_menu_input network "要绑定的 IP/CIDR："
+        if [[ -n "$key" && -n "$client_name" && -n "$network" ]]; then
+          run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user client-allow-ip "$key" "$client_name" "$network"
+        else
+          log "用户、设备名和 IP/CIDR 都不能为空"
+        fi
+        pause_menu
+        ;;
+      5)
+        read_menu_input key "用户名或 slug："
+        read_menu_input client_name "设备名："
+        read_menu_input network "要解除的 IP/CIDR："
+        if [[ -n "$key" && -n "$client_name" && -n "$network" ]]; then
+          run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user client-deny-ip "$key" "$client_name" "$network"
+        else
+          log "用户、设备名和 IP/CIDR 都不能为空"
+        fi
+        pause_menu
+        ;;
+      6)
+        read_menu_input key "用户名或 slug："
+        read_menu_input network "要允许的 IP/CIDR："
+        if [[ -n "$key" && -n "$network" ]]; then
+          run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user allow-ip "$key" "$network"
+        else
+          log "用户和 IP/CIDR 不能为空"
+        fi
+        pause_menu
+        ;;
+      7)
+        read_menu_input key "用户名或 slug："
+        read_menu_input network "要删除的 IP/CIDR："
+        if [[ -n "$key" && -n "$network" ]]; then
+          run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user deny-ip "$key" "$network"
+        else
+          log "用户和 IP/CIDR 不能为空"
+        fi
+        pause_menu
+        ;;
+      8)
+        read_menu_input key "用户名或 slug："
+        [[ -n "$key" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user share "$key"
+        pause_menu
+        ;;
+      9)
+        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user list
+        pause_menu
+        ;;
+      0|q|Q) return 0 ;;
+      *) log "未知选项：$choice"; pause_menu ;;
+    esac
+  done
+}
+
+ssh_security_menu() {
+  local choice ip
+  while true; do
+    cat <<'EOF'
+
+========== SSH 安全防护 ==========
+临时规则：24 小时内失败 3 次，封禁 24 小时
+永久规则：长期累计第 11 次失败，永久封禁
+重犯兜底：累计 4 次临时封禁，永久封禁
+----------------------------------
+1) 查看 SSH 封禁状态和 IP 列表
+2) 手动永久封禁 IP
+3) 解除 IP 的全部封禁
+4) 重新应用最高安全配置
+0) 返回主菜单
+EOF
+    read_menu_input choice "请选择："
+    case "$choice" in
+      1)
+        run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" security status
+        pause_menu
+        ;;
+      2)
+        read_menu_input ip "要永久封禁的 IPv4/IPv6："
+        if [[ -n "$ip" ]] && confirm_menu_action "确定永久封禁 ${ip} 吗？"; then
+          run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" security ban "$ip"
+        else
+          log "已取消封禁"
+        fi
+        pause_menu
+        ;;
+      3)
+        read_menu_input ip "要解除封禁的 IPv4/IPv6："
+        [[ -n "$ip" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" security unban "$ip"
+        pause_menu
+        ;;
+      4)
+        if confirm_menu_action "确定重写并重启 SSH 安全防护吗？"; then
+          run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" security apply
+        else
+          log "已取消重新应用"
+        fi
+        pause_menu
+        ;;
+      0|q|Q) return 0 ;;
+      *) log "未知选项：$choice"; pause_menu ;;
+    esac
+  done
+}
+
 menu_loop() {
   require_root
   has_interactive_tty || {
@@ -563,25 +871,27 @@ menu_loop() {
     return 0
   }
 
-  local choice name prefix count start key format out_path confirm
+  local choice name prefix count start key format out_path update_sha
   while true; do
     menu_header
     cat <<'EOF'
-1) 验证
-2) 状态
-3) 加用户
-4) 批量加
-5) 用户
-6) 链接
-7) 禁用
-8) 启用
-9) 删除
-10) 导出
-11) 重载
-12) 证书
-13) 续签测试
-14) 查更新
-15) 更新
+1) 验证全部服务
+2) 查看服务状态
+3) 新增用户
+4) 批量新增用户
+5) 查看用户列表
+6) 查看用户链接
+7) 禁用用户
+8) 启用用户
+9) 删除用户
+10) 导出用户数据
+11) 重新生成并重载配置
+12) 查看 TLS 证书状态
+13) 测试 TLS 证书续签
+14) 检查项目更新
+15) 安全更新项目
+16) 订阅访问控制
+17) SSH 安全防护
 0) 退出
 EOF
     read_menu_input choice "选择："
@@ -629,8 +939,11 @@ EOF
       9)
         read_menu_input key "用户/slug："
         if [[ -n "$key" ]]; then
-          read_menu_input confirm "删除 ${key}？输入 yes："
-          [[ "$confirm" == "yes" ]] && run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user del "$key"
+          if confirm_menu_action "确定删除用户 ${key} 吗？"; then
+            run_menu_command bash "$SCRIPT_DIR/proxy-stack.sh" user del "$key"
+          else
+            log "已取消删除"
+          fi
         fi
         pause_menu
         ;;
@@ -643,7 +956,7 @@ EOF
         ;;
       11)
         run_menu_command progress_step 1 3 "生成配置" bash "$SCRIPT_DIR/proxy-stack.sh" render
-        run_menu_command progress_step 2 3 "重启服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-web nginx
+        run_menu_command progress_step 2 3 "重启服务" systemctl restart proxy-stack-xray proxy-stack-hysteria proxy-stack-sing-box proxy-stack-web nginx
         run_menu_command progress_step 3 3 "验证服务" bash "$SCRIPT_DIR/proxy-stack.sh" verify
         pause_menu
         ;;
@@ -660,8 +973,19 @@ EOF
         pause_menu
         ;;
       15)
-        run_menu_command update_project
+        read_menu_input update_sha "更新包 SHA-256："
+        if [[ "$update_sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
+          PROXY_STACK_UPDATE_SHA256="$update_sha" run_menu_command update_project
+        else
+          log "SHA-256 格式无效，已取消更新"
+        fi
         pause_menu
+        ;;
+      16)
+        subscription_access_menu
+        ;;
+      17)
+        ssh_security_menu
         ;;
       0|q|Q)
         log "已退出管理菜单。后续输入 seroncheng 可再次打开。"
@@ -687,6 +1011,7 @@ start_menu_if_interactive() {
 user_add() {
   require_root
   local name="${1:?必须提供用户名}"
+  validate_user_name "用户名" "$name"
   local slug uuid hy2
   slug="$(random_slug)"
   uuid="$(random_uuid)"
@@ -723,10 +1048,11 @@ user_batch_add() {
   local prefix="${1:?必须提供用户名前缀}"
   local count="${2:?必须提供数量}"
   local start="${3:-1}"
+  validate_user_name "用户名前缀" "$prefix"
+  (( ${#prefix} <= 60 )) || die "用户名前缀最多 60 位"
   python3 - "$STATE_DIR/users.json" "$prefix" "$count" "$start" <<'PY'
 import json
 import secrets
-import string
 import sys
 import uuid
 from pathlib import Path
@@ -737,10 +1063,8 @@ count = int(sys.argv[3])
 start = int(sys.argv[4])
 if count <= 0:
     raise SystemExit("数量必须大于 0")
-alphabet = string.ascii_letters + string.digits
-
 def rand_slug():
-    return ''.join(secrets.choice(alphabet) for _ in range(10))
+    return secrets.token_urlsafe(24)
 
 def rand_token():
     return secrets.token_urlsafe(18)
@@ -788,7 +1112,7 @@ for user in users:
     if user.get("name") == key or user.get("slug") == key:
         user["enabled"] = want
         path.write_text(json.dumps(data, indent=2))
-        print(json.dumps(user))
+        print(f'{user.get("name", key)}: {"enabled" if want else "disabled"}')
         raise SystemExit(0)
 raise SystemExit("用户不存在")
 PY
@@ -822,6 +1146,187 @@ PY
   log "已删除用户：${key}"
 }
 
+normalize_ip_network() {
+  local value="${1:?IP/CIDR 不能为空}"
+  python3 - "$value" <<'PY'
+import ipaddress
+import sys
+
+try:
+    print(ipaddress.ip_network(sys.argv[1], strict=False))
+except ValueError:
+    raise SystemExit(f"IP/CIDR 无效：{sys.argv[1]}")
+PY
+}
+
+validate_single_ip() {
+  local value="${1:?IP 不能为空}"
+  python3 - "$value" <<'PY'
+import ipaddress
+import sys
+
+try:
+    print(ipaddress.ip_address(sys.argv[1]))
+except ValueError:
+    raise SystemExit(f"IP 无效：{sys.argv[1]}")
+PY
+}
+
+user_access_mutate() {
+  require_root
+  local operation="${1:?缺少操作}"
+  local key="${2:?必须提供用户名称或 slug}"
+  local client_name="${3:-}"
+  local network="${4:-}"
+  python3 - "$STATE_DIR/users.json" "$operation" "$key" "$client_name" "$network" <<'PY'
+import json
+import os
+import secrets
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+operation, key, client_name, network = sys.argv[2:6]
+data = json.loads(path.read_text())
+user = next(
+    (item for item in data.setdefault("users", [])
+     if item.get("name") == key or item.get("slug") == key),
+    None,
+)
+if not user:
+    raise SystemExit("用户不存在")
+
+user.setdefault("allowed_ips", [])
+clients = user.setdefault("subscription_clients", [])
+
+if operation == "client-add":
+    if any(item.get("name") == client_name for item in clients):
+        raise SystemExit("设备名已存在")
+    client = {
+        "name": client_name,
+        "token": secrets.token_urlsafe(32),
+        "enabled": True,
+        "allowed_ips": [network] if network else [],
+    }
+    clients.append(client)
+    print(f'已允许设备：{client_name}')
+elif operation == "client-del":
+    remaining = [item for item in clients if item.get("name") != client_name]
+    if len(remaining) == len(clients):
+        raise SystemExit("设备不存在")
+    user["subscription_clients"] = remaining
+    print(f'已撤销设备：{client_name}')
+elif operation in {"client-allow-ip", "client-deny-ip"}:
+    client = next((item for item in clients if item.get("name") == client_name), None)
+    if not client:
+        raise SystemExit("设备不存在")
+    values = client.setdefault("allowed_ips", [])
+    if operation == "client-allow-ip":
+        if network not in values:
+            values.append(network)
+        print(f'设备 {client_name} 已绑定：{network}')
+    else:
+        if network not in values:
+            raise SystemExit("该设备未绑定此 IP/CIDR")
+        values.remove(network)
+        print(f'设备 {client_name} 已解除绑定：{network}')
+elif operation == "allow-ip":
+    if network not in user["allowed_ips"]:
+        user["allowed_ips"].append(network)
+    print(f'已允许来源：{network}')
+elif operation == "deny-ip":
+    if network not in user["allowed_ips"]:
+        raise SystemExit("用户白名单中不存在此 IP/CIDR")
+    user["allowed_ips"].remove(network)
+    print(f'已移除来源：{network}')
+else:
+    raise SystemExit("未知的访问控制操作")
+
+fd, tmp_name = tempfile.mkstemp(prefix=".users-", suffix=".json", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_name, 0o640)
+    os.replace(tmp_name, path)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
+PY
+  secure_state_file "$STATE_DIR/users.json" "$WEB_SERVICE_GROUP"
+}
+
+user_client_add() {
+  local key="${1:?必须提供用户名称或 slug}"
+  local client_name="${2:?必须提供设备名}"
+  local network=""
+  validate_user_name "设备名" "$client_name"
+  [[ -z "${3:-}" ]] || network="$(normalize_ip_network "$3")"
+  user_access_mutate client-add "$key" "$client_name" "$network"
+  user_access "$key"
+}
+
+user_client_del() {
+  local key="${1:?必须提供用户名称或 slug}"
+  local client_name="${2:?必须提供设备名}"
+  validate_user_name "设备名" "$client_name"
+  user_access_mutate client-del "$key" "$client_name"
+}
+
+user_client_ip_change() {
+  local operation="${1:?缺少操作}" key="${2:?必须提供用户名称或 slug}"
+  local client_name="${3:?必须提供设备名}"
+  local network
+  validate_user_name "设备名" "$client_name"
+  network="$(normalize_ip_network "${4:?必须提供 IP/CIDR}")"
+  user_access_mutate "$operation" "$key" "$client_name" "$network"
+}
+
+user_ip_change() {
+  local operation="${1:?缺少操作}" key="${2:?必须提供用户名称或 slug}"
+  local network
+  network="$(normalize_ip_network "${3:?必须提供 IP/CIDR}")"
+  user_access_mutate "$operation" "$key" "" "$network"
+}
+
+user_access() {
+  require_root
+  local key="${1:?必须提供用户名称或 slug}"
+  load_env
+  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" <<'PY'
+import json
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+users = json.loads(Path(sys.argv[1]).read_text()).get("users", [])
+key, domain = sys.argv[2:4]
+user = next((item for item in users if item.get("name") == key or item.get("slug") == key), None)
+if not user:
+    raise SystemExit("用户不存在")
+
+print(f'用户：{user["name"]}')
+print('用户 IP/CIDR 白名单：' + (', '.join(user.get("allowed_ips", [])) or '无'))
+clients = user.get("subscription_clients", [])
+if not clients:
+    print('允许的设备：无')
+for client in clients:
+    status = '启用' if client.get("enabled", True) else '禁用'
+    bound = ', '.join(client.get("allowed_ips", [])) or '任意来源 IP'
+    token = str(client.get("token", ""))
+    print(f'\n设备：{client.get("name", "unnamed")} [{status}]')
+    print(f'绑定：{bound}')
+    print(f'令牌：{token}')
+    if token and client.get("enabled", True):
+        query = quote(token, safe="")
+        print(f'交付页面：https://{domain}/web/{user["slug"]}?client={query}')
+        print(f'通用订阅：https://{domain}/link/{user["slug"]}?client={query}')
+        print(f'Mihomo配置：https://{domain}/mihomo/{user["slug"]}?client={query}')
+PY
+}
+
 user_list() {
   require_root
   jq -r '.users[] | [.name, .slug, (if .enabled then "启用" else "禁用" end)] | @tsv' "$STATE_DIR/users.json"
@@ -831,14 +1336,14 @@ user_show() {
   require_root
   local key="${1:?必须提供用户名称或 slug}"
   load_env
-  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" <<'PY'
+  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" <<'PY'
 import json
 import sys
 from pathlib import Path
 from urllib.parse import quote
 
 users = json.loads(Path(sys.argv[1]).read_text()).get("users", [])
-key, domain, public_ip, pbk, sni, sid, obfs = sys.argv[2:9]
+key, domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port = sys.argv[2:12]
 u = None
 for item in users:
     if item["name"] == key or item["slug"] == key:
@@ -846,6 +1351,12 @@ for item in users:
         break
 if not u:
     raise SystemExit("用户不存在")
+client_token = next(
+    (str(item.get("token", "")) for item in u.get("subscription_clients", [])
+     if item.get("enabled", True) and item.get("token")),
+    "",
+)
+subscription_query = f'?client={quote(client_token, safe="")}' if client_token else ""
 vless = (
     f'vless://{u["vless_uuid"]}@{public_ip}:443'
     f'?type=tcp&security=reality&pbk={quote(pbk)}&fp=chrome'
@@ -859,14 +1370,30 @@ hy2 = (
 if obfs:
     hy2 += f'&obfs=salamander&obfs-password={quote(obfs)}'
 hy2 += f'#{quote(u["name"] + "-hy2")}'
+anytls = (
+    f'anytls://{quote(u["anytls_password"], safe="")}@{public_ip}:{anytls_port}'
+    f'?security=tls&sni={quote(domain)}&fp=chrome#{quote(u["name"] + "-anytls")}'
+)
+tuic = (
+    f'tuic://{quote(u["tuic_uuid"], safe="")}:{quote(u["tuic_password"], safe="")}@{public_ip}:{tuic_port}'
+    f'?sni={quote(domain)}&alpn=h3&congestion_control=bbr&udp_relay_mode=native'
+    f'&zero_rtt_handshake=false#{quote(u["name"] + "-tuic")}'
+)
+naive = (
+    f'naive+https://{quote(u["naive_username"], safe="")}:{quote(u["naive_password"], safe="")}'
+    f'@{domain}:{naive_port}#{quote(u["name"] + "-naive")}'
+)
 print(f'用户名：{u["name"]}')
 print(f'短码：{u["slug"]}')
-print(f'交付页面：https://{domain}/web/{u["slug"]}')
-print(f'通用订阅：https://{domain}/link/{u["slug"]}')
-print(f'Mihomo配置：https://{domain}/mihomo/{u["slug"]}')
-print(f'原始节点：https://{domain}/node/{u["slug"]}')
+print(f'交付页面：https://{domain}/web/{u["slug"]}{subscription_query}')
+print(f'通用订阅：https://{domain}/link/{u["slug"]}{subscription_query}')
+print(f'Mihomo配置：https://{domain}/mihomo/{u["slug"]}{subscription_query}')
+print(f'原始节点：https://{domain}/node/{u["slug"]}{subscription_query}')
 print(f'VLESS链接：{vless}')
 print(f'Hysteria2链接：{hy2}')
+print(f'AnyTLS链接：{anytls}')
+print(f'TUIC链接：{tuic}')
+print(f'NaiveProxy链接：{naive}')
 PY
 }
 
@@ -874,14 +1401,14 @@ user_share() {
   require_root
   local key="${1:?必须提供用户名称或 slug}"
   load_env
-  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" <<'PY'
+  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" <<'PY'
 import json
 import sys
 from pathlib import Path
 from urllib.parse import quote
 
 users = json.loads(Path(sys.argv[1]).read_text()).get("users", [])
-key, domain, public_ip, pbk, sni, sid, obfs = sys.argv[2:9]
+key, domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port = sys.argv[2:12]
 u = None
 for item in users:
     if item["name"] == key or item["slug"] == key:
@@ -889,6 +1416,12 @@ for item in users:
         break
 if not u:
     raise SystemExit("用户不存在")
+client_token = next(
+    (str(item.get("token", "")) for item in u.get("subscription_clients", [])
+     if item.get("enabled", True) and item.get("token")),
+    "",
+)
+subscription_query = f'?client={quote(client_token, safe="")}' if client_token else ""
 vless = (
     f'vless://{u["vless_uuid"]}@{public_ip}:443'
     f'?type=tcp&security=reality&pbk={quote(pbk)}&fp=chrome'
@@ -902,17 +1435,39 @@ hy2 = (
 if obfs:
     hy2 += f'&obfs=salamander&obfs-password={quote(obfs)}'
 hy2 += f'#{quote(u["name"] + "-hy2")}'
+anytls = (
+    f'anytls://{quote(u["anytls_password"], safe="")}@{public_ip}:{anytls_port}'
+    f'?security=tls&sni={quote(domain)}&fp=chrome#{quote(u["name"] + "-anytls")}'
+)
+tuic = (
+    f'tuic://{quote(u["tuic_uuid"], safe="")}:{quote(u["tuic_password"], safe="")}@{public_ip}:{tuic_port}'
+    f'?sni={quote(domain)}&alpn=h3&congestion_control=bbr&udp_relay_mode=native'
+    f'&zero_rtt_handshake=false#{quote(u["name"] + "-tuic")}'
+)
+naive = (
+    f'naive+https://{quote(u["naive_username"], safe="")}:{quote(u["naive_password"], safe="")}'
+    f'@{domain}:{naive_port}#{quote(u["name"] + "-naive")}'
+)
 print(f"""[{u['name']}]
-交付页面: https://{domain}/web/{u['slug']}
-通用订阅: https://{domain}/link/{u['slug']}
-Mihomo配置: https://{domain}/mihomo/{u['slug']}
-原始节点: https://{domain}/node/{u['slug']}
+交付页面: https://{domain}/web/{u['slug']}{subscription_query}
+通用订阅: https://{domain}/link/{u['slug']}{subscription_query}
+Mihomo配置: https://{domain}/mihomo/{u['slug']}{subscription_query}
+原始节点: https://{domain}/node/{u['slug']}{subscription_query}
 
 VLESS:
 {vless}
 
 Hysteria2:
 {hy2}
+
+AnyTLS:
+{anytls}
+
+TUIC v5:
+{tuic}
+
+NaiveProxy:
+{naive}
 """)
 PY
 }
@@ -936,7 +1491,7 @@ user_export() {
       die "不支持的导出格式：$format"
       ;;
   esac
-  python3 - "$STATE_DIR/users.json" "$format" "$out_path" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" <<'PY'
+  python3 - "$STATE_DIR/users.json" "$format" "$out_path" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" <<'PY'
 import csv
 import json
 import sys
@@ -946,11 +1501,17 @@ from urllib.parse import quote
 users_path = Path(sys.argv[1])
 fmt = sys.argv[2]
 out_path = Path(sys.argv[3])
-domain, public_ip, pbk, sni, sid, obfs = sys.argv[4:10]
+domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port = sys.argv[4:13]
 users = json.loads(users_path.read_text()).get("users", [])
 
 rows = []
 for u in users:
+    client_token = next(
+        (str(item.get("token", "")) for item in u.get("subscription_clients", [])
+         if item.get("enabled", True) and item.get("token")),
+        "",
+    )
+    subscription_query = f'?client={quote(client_token, safe="")}' if client_token else ""
     vless = (
         f'vless://{u["vless_uuid"]}@{public_ip}:443'
         f'?type=tcp&security=reality&pbk={quote(pbk)}&fp=chrome'
@@ -964,16 +1525,32 @@ for u in users:
     if obfs:
         hy2 += f'&obfs=salamander&obfs-password={quote(obfs)}'
     hy2 += f'#{quote(u["name"] + "-hy2")}'
+    anytls = (
+        f'anytls://{quote(u["anytls_password"], safe="")}@{public_ip}:{anytls_port}'
+        f'?security=tls&sni={quote(domain)}&fp=chrome#{quote(u["name"] + "-anytls")}'
+    )
+    tuic = (
+        f'tuic://{quote(u["tuic_uuid"], safe="")}:{quote(u["tuic_password"], safe="")}@{public_ip}:{tuic_port}'
+        f'?sni={quote(domain)}&alpn=h3&congestion_control=bbr&udp_relay_mode=native'
+        f'&zero_rtt_handshake=false#{quote(u["name"] + "-tuic")}'
+    )
+    naive = (
+        f'naive+https://{quote(u["naive_username"], safe="")}:{quote(u["naive_password"], safe="")}'
+        f'@{domain}:{naive_port}#{quote(u["name"] + "-naive")}'
+    )
     rows.append({
         "name": u["name"],
         "slug": u["slug"],
         "enabled": bool(u.get("enabled", True)),
-        "web": f'https://{domain}/web/{u["slug"]}',
-        "link": f'https://{domain}/link/{u["slug"]}',
-        "mihomo": f'https://{domain}/mihomo/{u["slug"]}',
-        "node": f'https://{domain}/node/{u["slug"]}',
+        "web": f'https://{domain}/web/{u["slug"]}{subscription_query}',
+        "link": f'https://{domain}/link/{u["slug"]}{subscription_query}',
+        "mihomo": f'https://{domain}/mihomo/{u["slug"]}{subscription_query}',
+        "node": f'https://{domain}/node/{u["slug"]}{subscription_query}',
         "vless": vless,
         "hy2": hy2,
+        "anytls": anytls,
+        "tuic": tuic,
+        "naive": naive,
     })
 
 out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -981,7 +1558,7 @@ if fmt == "json":
     out_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
 elif fmt == "csv":
     with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "slug", "enabled", "web", "link", "mihomo", "node", "vless", "hy2"])
+        writer = csv.DictWriter(f, fieldnames=["name", "slug", "enabled", "web", "link", "mihomo", "node", "vless", "hy2", "anytls", "tuic", "naive"])
         writer.writeheader()
         writer.writerows(rows)
 else:
@@ -996,9 +1573,88 @@ else:
                 f"原始节点: {row['node']}\n"
                 f"VLESS链接: {row['vless']}\n"
                 f"Hysteria2链接: {row['hy2']}\n\n"
+                f"AnyTLS链接: {row['anytls']}\n"
+                f"TUIC链接: {row['tuic']}\n"
+                f"NaiveProxy链接: {row['naive']}\n\n"
             )
 print(out_path)
 PY
+  chmod 0600 "$out_path"
+}
+
+fail2ban_status_value() {
+  local output="$1" label="$2"
+  awk -v label="$label" '
+    index($0, label ":") {
+      sub("^.*" label ":[[:space:]]*", "")
+      print
+      exit
+    }
+  ' <<<"$output"
+}
+
+security_status() {
+  require_root
+  require_cmd fail2ban-client
+  systemctl is-active --quiet fail2ban || die "Fail2ban 未运行"
+  local jail title output current_failed total_failed current_banned total_banned banned_ips
+  printf '\n========== SSH 封禁状态 ==========\n'
+  printf '服务状态：运行中\n'
+  printf '临时规则：24 小时内失败 3 次，封禁 24 小时\n'
+  printf '永久规则：长期累计第 11 次失败，永久封禁\n'
+  printf '重犯兜底：累计 4 次临时封禁，永久封禁\n'
+  for jail in proxy-stack-sshd-day proxy-stack-sshd-permanent proxy-stack-recidive; do
+    case "$jail" in
+      proxy-stack-sshd-day) title="24 小时临时封禁" ;;
+      proxy-stack-sshd-permanent) title="SSH 失败累计永久封禁" ;;
+      proxy-stack-recidive) title="重复违规永久封禁" ;;
+    esac
+    output="$(fail2ban-client status "$jail")" || die "读取 ${title} 状态失败"
+    current_failed="$(fail2ban_status_value "$output" "Currently failed")"
+    total_failed="$(fail2ban_status_value "$output" "Total failed")"
+    current_banned="$(fail2ban_status_value "$output" "Currently banned")"
+    total_banned="$(fail2ban_status_value "$output" "Total banned")"
+    banned_ips="$(fail2ban_status_value "$output" "Banned IP list")"
+    printf '\n[%s]\n' "$title"
+    printf '当前失败记录：%s\n' "${current_failed:-0}"
+    printf '累计失败记录：%s\n' "${total_failed:-0}"
+    printf '当前封禁数量：%s\n' "${current_banned:-0}"
+    printf '累计封禁数量：%s\n' "${total_banned:-0}"
+    printf '已封禁 IP：%s\n' "${banned_ips:-无}"
+  done
+}
+
+security_apply() {
+  require_root
+  install_fail2ban_if_needed
+  write_fail2ban_config
+  quiet_cmd "检查 Fail2ban 配置" fail2ban-client -t
+  quiet_cmd "启用 SSH 安全防护" systemctl enable --now fail2ban
+  quiet_cmd "重启 SSH 安全防护" systemctl restart fail2ban
+  log "已重新应用 SSH 最高安全配置"
+  security_status
+}
+
+security_ban() {
+  require_root
+  require_cmd fail2ban-client python3
+  local ip
+  ip="$(validate_single_ip "${1:?必须提供 IP}")"
+  systemctl is-active --quiet fail2ban || die "Fail2ban 未运行"
+  fail2ban-client set proxy-stack-sshd-permanent banip "$ip" >/dev/null
+  log "已永久封禁：${ip}"
+}
+
+security_unban() {
+  require_root
+  require_cmd fail2ban-client python3
+  local ip jail
+  ip="$(validate_single_ip "${1:?必须提供 IP}")"
+  systemctl is-active --quiet fail2ban || die "Fail2ban 未运行"
+  for jail in proxy-stack-sshd-day proxy-stack-sshd-permanent proxy-stack-recidive; do
+    fail2ban-client set "$jail" unbanip "$ip" >/dev/null 2>&1 || true
+  done
+  log "已从全部 SSH 封禁列表解除：${ip}"
 }
 
 uninstall_3xui() {
@@ -1031,6 +1687,7 @@ case "$cmd" in
   verify) verify_stack ;;
   check-update) check_project_update ;;
   update) update_project ;;
+  install-binaries) require_root; ensure_dirs; install_pinned_proxy_binaries ;;
   menu) menu_loop ;;
   user)
     sub="${2:-}"
@@ -1044,6 +1701,23 @@ case "$cmd" in
       share) user_share "${3:-}" ;;
       export) user_export "${3:-csv}" "${4:-}" ;;
       show) user_show "${3:-}" ;;
+      client-add) user_client_add "${3:-}" "${4:-}" "${5:-}" ;;
+      client-del) user_client_del "${3:-}" "${4:-}" ;;
+      client-allow-ip) user_client_ip_change client-allow-ip "${3:-}" "${4:-}" "${5:-}" ;;
+      client-deny-ip) user_client_ip_change client-deny-ip "${3:-}" "${4:-}" "${5:-}" ;;
+      allow-ip) user_ip_change allow-ip "${3:-}" "${4:-}" ;;
+      deny-ip) user_ip_change deny-ip "${3:-}" "${4:-}" ;;
+      access) user_access "${3:-}" ;;
+      *) usage; exit 1 ;;
+    esac
+    ;;
+  security)
+    sub="${2:-}"
+    case "$sub" in
+      status) security_status ;;
+      ban) security_ban "${3:-}" ;;
+      unban) security_unban "${3:-}" ;;
+      apply) security_apply ;;
       *) usage; exit 1 ;;
     esac
     ;;
