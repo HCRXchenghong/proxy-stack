@@ -26,6 +26,7 @@ ENV = {
     "ANYTLS_PORT": "8443",
     "TUIC_PORT": "8443",
     "NAIVE_PORT": "8444",
+    "HTTPS_PORT": "8445",
     "INTERNAL_PROXY_TOKEN": "N" * 43,
 }
 
@@ -39,6 +40,8 @@ USER = {
     "tuic_password": "tuic-secret",
     "naive_username": "u_abcdefghijklmnopqrstuvwxyz012345",
     "naive_password": "naive-secret",
+    "https_username": "h_abcdefghijklmnopqrstuvwxyz012345",
+    "https_password": "https-secret",
     "allowed_ips": [],
     "subscription_clients": [
         {
@@ -69,25 +72,26 @@ class DeliverySecurityTests(unittest.TestCase):
         (self.state / "users.json").write_text(json.dumps({"users": [disabled]}))
         self.assertIsNone(app.find_user(self.state, USER["slug"]))
 
-    def test_raw_subscription_contains_five_distinct_protocols(self):
+    def test_raw_subscription_contains_six_distinct_protocols(self):
         links = app.raw_links(ENV, USER)
-        self.assertEqual(len(links), 5)
+        self.assertEqual(len(links), 6)
         self.assertEqual(
             [link.split(":", 1)[0] for link in links],
-            ["vless", "hysteria2", "anytls", "tuic", "naive+https"],
+            ["vless", "hysteria2", "anytls", "tuic", "naive+https", "https"],
         )
 
     def test_mihomo_is_not_a_lan_open_proxy(self):
         config = app.render_clash(ENV, USER)
         self.assertIn("allow-lan: false", config)
         self.assertNotIn("allow-lan: true", config)
-        for proxy_type in ("vless", "hysteria2", "anytls", "tuic"):
+        for proxy_type in ("vless", "hysteria2", "anytls", "tuic", "http"):
             self.assertIn(f"type: {proxy_type}", config)
         self.assertIn("reduce-rtt: false", config)
+        self.assertIn("skip-cert-verify: false", config)
 
     def test_base64_subscription_round_trip(self):
         payload = base64.b64encode("\n".join(app.raw_links(ENV, USER)).encode())
-        self.assertEqual(len(base64.b64decode(payload).decode().splitlines()), 5)
+        self.assertEqual(len(base64.b64decode(payload).decode().splitlines()), 6)
 
     def test_non_ascii_or_wrong_client_tokens_are_rejected_safely(self):
         self.assertEqual(app.authorize_subscription(USER, "192.0.2.1", ["错误令牌"]), (False, ""))
@@ -105,6 +109,8 @@ class DeliverySecurityTests(unittest.TestCase):
         self.assertFalse(app.validate_runtime_env(poisoned))
         weak_internal_token = dict(ENV, INTERNAL_PROXY_TOKEN="short")
         self.assertFalse(app.validate_runtime_env(weak_internal_token))
+        colliding_https = dict(ENV, HTTPS_PORT=ENV["NAIVE_PORT"])
+        self.assertFalse(app.validate_runtime_env(colliding_https))
 
     def test_http_routes_do_not_accept_username(self):
         app.App.state_dir = self.state
@@ -125,7 +131,7 @@ class DeliverySecurityTests(unittest.TestCase):
             )
             self.assertIsNone(response.headers.get("Server"))
             body = response.read().decode()
-            self.assertEqual(len(body.splitlines()), 5)
+            self.assertEqual(len(body.splitlines()), 6)
         finally:
             server.shutdown()
             server.server_close()
@@ -153,7 +159,7 @@ class DeliverySecurityTests(unittest.TestCase):
                 },
             )
             body = urllib.request.urlopen(trusted, timeout=2).read().decode()
-            self.assertEqual(len(body.splitlines()), 5)
+            self.assertEqual(len(body.splitlines()), 6)
         finally:
             server.shutdown()
             server.server_close()
@@ -277,7 +283,15 @@ class RenderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_name:
             state = Path(temp_name)
             old_user = dict(USER, slug="AbCd123456", vless_uuid="old-vless", hy2_auth="old-hy2")
-            for key in ("anytls_password", "tuic_uuid", "tuic_password", "naive_username", "naive_password"):
+            for key in (
+                "anytls_password",
+                "tuic_uuid",
+                "tuic_password",
+                "naive_username",
+                "naive_password",
+                "https_username",
+                "https_password",
+            ):
                 old_user.pop(key)
             (state / "stack.env").write_text("HY2_OBFS_PASSWORD=old-obfs\n")
             (state / "users.json").write_text(json.dumps({"users": [old_user]}))
@@ -297,11 +311,13 @@ ensure_user_protocol_credentials
             )
             migrated = json.loads((state / "users.json").read_text())
             user = migrated["users"][0]
-            self.assertEqual(migrated["schema_version"], 3)
+            self.assertEqual(migrated["schema_version"], 4)
             self.assertGreaterEqual(len(user["slug"]), 24)
             self.assertNotEqual(user["vless_uuid"], "old-vless")
             self.assertNotEqual(user["hy2_auth"], "old-hy2")
             self.assertTrue(user["anytls_password"])
+            self.assertTrue(user["https_username"])
+            self.assertTrue(user["https_password"])
             self.assertEqual(user["allowed_ips"], [])
             self.assertEqual(user["subscription_clients"][0]["name"], "default")
             self.assertGreaterEqual(len(user["subscription_clients"][0]["token"]), 40)
@@ -321,11 +337,11 @@ ensure_user_protocol_credentials
         self.assertRegex(result.stdout.strip(), r"^[A-Za-z0-9_-]{40,}$")
         self.assertNotIn("=", result.stdout)
 
-    def test_sing_box_server_has_three_hardened_inbounds(self):
+    def test_sing_box_server_has_four_hardened_inbounds(self):
         with tempfile.TemporaryDirectory() as temp_name:
             state = Path(temp_name)
             (state / "stack.env").write_text(
-                "WEB_DOMAIN=node.example.net\nANYTLS_PORT=8443\nTUIC_PORT=8443\nNAIVE_PORT=8444\n"
+                "WEB_DOMAIN=node.example.net\nANYTLS_PORT=8443\nTUIC_PORT=8443\nNAIVE_PORT=8444\nHTTPS_PORT=8445\n"
             )
             (state / "users.json").write_text(json.dumps({"users": [USER]}))
             command = r'''
@@ -335,6 +351,7 @@ SERVICE_TLS_DIR="$2/tls"
 ANYTLS_PORT=8443
 TUIC_PORT=8443
 NAIVE_PORT=8444
+HTTPS_PORT=8445
 secure_state_file() { chmod 0600 "$1"; }
 write_sing_box_config
 '''
@@ -343,8 +360,10 @@ write_sing_box_config
                 check=True,
             )
             config = json.loads((state / "sing-box.json").read_text())
-            self.assertEqual([item["type"] for item in config["inbounds"]], ["anytls", "tuic", "naive"])
+            self.assertEqual([item["type"] for item in config["inbounds"]], ["anytls", "tuic", "naive", "http"])
             self.assertFalse(config["inbounds"][1]["zero_rtt_handshake"])
+            self.assertEqual(config["inbounds"][3]["listen_port"], 8445)
+            self.assertEqual(config["inbounds"][3]["tls"]["min_version"], "1.3")
             self.assertEqual(config["dns"]["servers"], [{"type": "local", "tag": "local"}])
             self.assertEqual(
                 config["route"]["rules"][0],
@@ -423,6 +442,13 @@ write_sing_box_config
         self.assertIn("导出目标不能是符号链接", script)
         self.assertIn("导出文件只允许写入 /root、/home/<用户> 或 /var/backups", script)
         self.assertIn("os.replace(tmp_name, out_path)", script)
+
+    def test_management_outputs_include_https_proxy_links(self):
+        script = (Path(__file__).parents[1] / "proxy-stack.sh").read_text()
+        self.assertIn("HTTPS_PORT=${HTTPS_PORT}", script)
+        self.assertIn("HTTPS代理链接", script)
+        self.assertIn('"https": https_proxy', script)
+        self.assertIn('"naive", "https"', script)
 
 
 class ArchiveExtractionTests(unittest.TestCase):

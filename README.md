@@ -1,6 +1,6 @@
 # Proxy Stack
 
-Ubuntu 一键部署五协议安全代理栈：VLESS + REALITY + Vision、Hysteria2、AnyTLS、TUIC v5、NaiveProxy，以及安全交付页、通用 URI 和 Mihomo/Clash Meta 订阅。
+Ubuntu 一键部署六协议安全代理栈：VLESS + REALITY + Vision、Hysteria2、AnyTLS、TUIC v5、NaiveProxy、HTTPS Proxy，以及安全交付页、通用 URI 和 Mihomo/Clash Meta 订阅。
 
 ## 功能
 
@@ -9,6 +9,7 @@ Ubuntu 一键部署五协议安全代理栈：VLESS + REALITY + Vision、Hysteri
 - AnyTLS：TCP 8443，TLS 1.3、填充和多会话复用。
 - TUIC v5：UDP 8443，关闭有重放风险的 0-RTT。
 - NaiveProxy：TCP 8444，HTTPS/H2 高隐蔽备用线路。
+- HTTPS Proxy：TCP 8445，HTTP CONNECT over TLS 1.3，独立用户名和随机密码。
 - 用户交付页：`https://你的域名/web/<slug>?client=<设备令牌>`。
 - 订阅输出：通用 base64 URI、原始 URI、Mihomo/Clash Meta YAML。
 - 订阅访问控制：每用户独立的 256 位设备令牌或 IP/CIDR 白名单，设备令牌还可继续绑定 IP/CIDR。
@@ -30,13 +31,13 @@ Ubuntu 一键部署五协议安全代理栈：VLESS + REALITY + Vision、Hysteri
 
 | 项目 | 1.x | 2.0 |
 | --- | --- | --- |
-| 代理协议 | VLESS + REALITY + Vision、Hysteria2 | 保留原两种，新增 AnyTLS、TUIC v5、NaiveProxy，共五路 |
+| 代理协议 | VLESS + REALITY + Vision、Hysteria2 | 保留原两种，新增 AnyTLS、TUIC v5、NaiveProxy、HTTPS Proxy，共六路 |
 | 管理入口 | 独立 `MANAGEMENT_DOMAIN` 公网反代到本机面板 | 删除公网管理面，只允许经 SSH 运行 `seroncheng` |
 | 订阅身份 | 用户名或较短 slug 即可访问 | 只查找高熵 slug，还必须通过独立设备令牌或 IP/CIDR 白名单 |
 | 设备控制 | 无 | 每台设备一枚可撤销的 256 位令牌，令牌可继续绑定 IP/CIDR |
 | 运行权限 | Xray、Hysteria2 和交付程序未显式降权，默认以 root 运行 | Web、Xray、Hysteria2、sing-box 使用四个独立无登录账号，并启用 systemd 沙箱 |
 | 私钥隔离 | Web 服务读取包含协议私钥的整个配置 | Web 只读取专用配置；REALITY 私钥只给 Xray，TLS 私钥副本只给专用证书组 |
-| 出站边界 | 无统一的私网/元数据阻断 | 五路协议统一阻断环回、私网、链路本地和云元数据地址 |
+| 出站边界 | 无统一的私网/元数据阻断 | 六路协议统一阻断环回、私网、链路本地和云元数据地址 |
 | 依赖下载 | 从最新 Release 动态下载，未固定文件哈希 | 固定 Xray、Hysteria2、sing-box 版本和 SHA-256，校验失败立即终止 |
 | 项目更新 | 下载远程 tarball 后直接覆盖 | 必须预先提供可信 SHA-256；安全解压会拒绝路径穿越、链接、特殊文件和解压炸弹 |
 | SSH 防护 | 未由项目统一管理 | 3 次失败封 24 小时，长期累计第 11 次永久封禁，再加重犯永久封禁 |
@@ -47,7 +48,7 @@ Ubuntu 一键部署五协议安全代理栈：VLESS + REALITY + Vision、Hysteri
 - 首次从 1.x 迁移时会轮换旧 slug、VLESS UUID、Hysteria2 用户密码、Hysteria2 混淆密钥和 REALITY 密钥/short ID。旧订阅与节点链接会失效。
 - 新订阅默认需要 `?client=<设备令牌>`；只有来源 IP 命中用户白名单时才可以不携带令牌。
 - `MANAGEMENT_DOMAIN` 只保留参数兼容，2.0 不会为它签证书、开放 nginx 路由或启用公网面板。
-- 新增 TCP 8443、UDP 8443 和 TCP 8444；如果要使用全部五路协议，必须同步修改云安全组和主机防火墙。
+- 新增 TCP 8443、UDP 8443、TCP 8444 和 TCP 8445；如果要使用全部六路协议，必须同步修改云安全组和主机防火墙。
 - Fail2ban 默认只豁免回环地址，管理员自己的公网 IP 也会受 SSH 失败计数规则约束。
 
 ## 系统要求
@@ -63,6 +64,7 @@ Ubuntu 一键部署五协议安全代理栈：VLESS + REALITY + Vision、Hysteri
   - TCP 8443：AnyTLS。
   - UDP 8443：TUIC v5。
   - TCP 8444：NaiveProxy。
+  - TCP 8445：HTTPS Proxy。
   - TCP SSH 端口：远程管理，由 Fail2ban 保护。
 - 如果域名使用 Cloudflare，请使用 DNS only，不要开启代理云朵。
 
@@ -156,7 +158,7 @@ sudo PROXY_STACK_UPDATE_SHA256=<64位SHA256> \
   bash /root/proxy-stack/proxy-stack.sh update
 ```
 
-当前项目版本：`2.0.1`。它是兼容 `2.0.0` 的安全加固补丁，补充了安全解压、真实来源 IP、DNS 重绑定/SSRF 防护、Web 资源限制、原子状态写入和更严格的服务沙箱，不改变五路协议及现有用户的使用方式。版本检测规则为：优先读取 GitHub 最新 Release；如果没有 Release，则读取最新 Tag。菜单中的更新操作也必须提供可信 SHA-256 环境变量。
+当前项目版本：`2.1.0`。它在 `2.0.1` 的安全加固基础上新增 HTTPS Proxy，并延续安全解压、真实来源 IP、DNS 重绑定/SSRF 防护、Web 资源限制、原子状态写入和更严格的服务沙箱。版本检测规则为：优先读取 GitHub 最新 Release；如果没有 Release，则读取最新 Tag。菜单中的更新操作也必须提供可信 SHA-256 环境变量。
 
 安装目录会被规范化并限制在专用子目录内；拒绝 `/`、系统顶层目录、符号链接、非 root 所有或组/其他用户可写的既有目录，避免 root 部署时误覆盖系统文件。
 
@@ -167,7 +169,7 @@ sudo PROXY_STACK_UPDATE_SHA256=<64位SHA256> \
 /etc/proxy-stack/stack.env        部署配置和 REALITY/HY2 密钥
 /etc/proxy-stack/public.env       Web 服务配置和内部代理令牌（仅 Web 服务组可读）
 /etc/proxy-stack/users.json       用户列表
-/etc/proxy-stack/sing-box.json    AnyTLS/TUIC/Naive 服务配置
+/etc/proxy-stack/sing-box.json    AnyTLS/TUIC/Naive/HTTPS Proxy 服务配置
 /opt/proxy-stack                  运行时文件和二进制
 /etc/nginx/conf.d/proxy-stack-*.conf
 /etc/nginx/stream-conf.d/proxy-stack-stream.conf
@@ -190,9 +192,9 @@ sudo bash /root/proxy-stack/proxy-stack.sh user add alice
 - 交付页面：用户打开后可复制各类链接。
 - 通用订阅：适合 v2rayN、v2rayNG、V2Box、Shadowrocket 等 URI 客户端。
 - Mihomo配置：适合 Mihomo / Clash Meta。
-- 原始节点：未 base64 的 VLESS 和 Hysteria2 原始节点。
-- VLESS / Hysteria2 / AnyTLS / TUIC / NaiveProxy：五条独立节点链接。
-- Mihomo 原生提供前四种协议；NaiveProxy 链接供 NaiveProxy、v2rayN 等兼容客户端单独导入。
+- 原始节点：未 base64 的全部节点 URI。
+- VLESS / Hysteria2 / AnyTLS / TUIC / NaiveProxy / HTTPS Proxy：六条独立节点链接。
+- Mihomo 原生提供 VLESS、Hysteria2、AnyTLS、TUIC 和 HTTPS Proxy；NaiveProxy 链接供 NaiveProxy、v2rayN 等兼容客户端单独导入。
 
 常用命令：
 
@@ -298,7 +300,7 @@ sudo bash /root/proxy-stack/proxy-stack.sh security unban 198.51.100.8
 - SNI 等于 `WEB_DOMAIN` 时转发到本机 HTTPS 交付站点。
 - 其他 SNI 默认转发到 Xray REALITY 入站。
 - UDP 443 由 Hysteria2 直接监听。
-- TCP/UDP 8443 分别由 AnyTLS、TUIC v5 监听；TCP 8444 由 NaiveProxy 监听。
+- TCP/UDP 8443 分别由 AnyTLS、TUIC v5 监听；TCP 8444 由 NaiveProxy 监听；TCP 8445 由 HTTPS Proxy 监听。
 
 ## 从 1.x 升级到 2.0
 
@@ -311,9 +313,9 @@ sudo bash /root/proxy-stack/proxy-stack.sh security unban 198.51.100.8
    sudo cp -a /root/proxy-stack /root/proxy-stack-code-v1-backup
    ```
 
-2. 检查云安全组/防火墙，在原 TCP/UDP 443 基础上放行 TCP 8443、UDP 8443 和 TCP 8444。
-3. 从 GitHub 取得并审阅最新的 `v2.0.1` 标签代码，再使用原来的真实 `WEB_DOMAIN`、证书邮箱或现有证书路径执行 `deploy.sh`。不要把未审阅的网络响应直接管道给 root shell。
-4. 首次 `render` 会把 `users.json` 升级到新结构，完成安全凭据轮换，为每个现有用户创建 `default` 设备令牌，并生成 AnyTLS、TUIC 和 NaiveProxy 凭据。这个迁移只会针对旧结构执行一次。
+2. 检查云安全组/防火墙，在原 TCP/UDP 443 基础上放行 TCP 8443、UDP 8443、TCP 8444 和 TCP 8445。
+3. 从 GitHub 取得并审阅最新的 `v2.1.0` 标签代码，再使用原来的真实 `WEB_DOMAIN`、证书邮箱或现有证书路径执行 `deploy.sh`。不要把未审阅的网络响应直接管道给 root shell。
+4. 首次 `render` 会把 `users.json` 升级到新结构，完成安全凭据轮换，为每个现有用户创建 `default` 设备令牌，并生成 AnyTLS、TUIC、NaiveProxy 和 HTTPS Proxy 凭据。这个迁移只会针对旧结构执行一次。
 5. 升级后立即重新导出并分发用户链接：
 
    ```bash
@@ -330,7 +332,7 @@ sudo bash /root/proxy-stack/proxy-stack.sh security unban 198.51.100.8
 
 如果升级失败，使用带外控制台登录，先保留日志和当前现场，再从上述两个备份目录恢复。
 
-五种协议位于同一台服务器时仍共享同一个封锁故障域。生产环境建议把同一份项目部署到至少两台不同供应商、不同 ASN 的服务器；交付站不要与所有代理节点共用一个源站 IP。
+六种协议位于同一台服务器时仍共享同一个封锁故障域。生产环境建议把同一份项目部署到至少两台不同供应商、不同 ASN 的服务器；交付站不要与所有代理节点共用一个源站 IP。
 
 运行时使用四个独立的无登录系统账号：`proxy-stack-web`、`proxy-stack-xray`、`proxy-stack-hysteria`、`proxy-stack-sing-box`。REALITY 私钥只授予 Xray，TLS 私钥副本只授予 Hysteria2/sing-box 的专用证书组；任一服务不再以 root 运行。
 
@@ -368,6 +370,6 @@ sudo nginx -t
 - 证书申请失败：确认用户域名解析到本机公网 IPv4，TCP 80 已放行，Cloudflare 为 DNS only，邮箱不是 `admin@example.com` 这类示例邮箱。
 - 页面打不开：确认 TCP 443 已放行，`nginx -t` 通过，`proxy-stack-web` 正常运行。
 - Hysteria2 不通：确认 UDP 443 已放行，并检查云厂商安全组。
-- AnyTLS/TUIC/NaiveProxy 不通：分别确认 TCP 8443、UDP 8443、TCP 8444 已放行。
+- AnyTLS/TUIC/NaiveProxy/HTTPS Proxy 不通：分别确认 TCP 8443、UDP 8443、TCP 8444、TCP 8445 已放行。
 - VLESS 不通：确认客户端使用 REALITY public key、short id、SNI 和 Vision flow。
 - REALITY 拒绝握手：确认服务器和客户端时间准确；安全配置只允许约 60 秒时钟偏差。

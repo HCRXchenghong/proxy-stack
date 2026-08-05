@@ -193,6 +193,8 @@ for user in data.setdefault("users", []):
         "tuic_password": secrets.token_urlsafe(24),
         "naive_username": "u_" + user["slug"],
         "naive_password": secrets.token_urlsafe(24),
+        "https_username": "h_" + user["slug"],
+        "https_password": secrets.token_urlsafe(24),
     }
     for key, value in defaults.items():
         if not user.get(key):
@@ -243,8 +245,8 @@ for user in data.setdefault("users", []):
         })
         changed = True
 
-if int(data.get("schema_version", 0)) < 3:
-    data["schema_version"] = 3
+if int(data.get("schema_version", 0)) < 4:
+    data["schema_version"] = 4
     changed = True
 
 if changed:
@@ -266,14 +268,14 @@ PY
 write_sing_box_config() {
   load_env
   python3 - "$STATE_DIR/users.json" "$STATE_DIR/sing-box.json" \
-    "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" "$SERVICE_TLS_DIR" <<'PY'
+    "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" "$HTTPS_PORT" "$SERVICE_TLS_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 users_path, out_path = map(Path, sys.argv[1:3])
-anytls_port, tuic_port, naive_port = map(int, sys.argv[3:6])
-tls_dir = sys.argv[6]
+anytls_port, tuic_port, naive_port, https_port = map(int, sys.argv[3:7])
+tls_dir = sys.argv[7]
 users = [u for u in json.loads(users_path.read_text()).get("users", []) if u.get("enabled", True)]
 
 def tls(alpn):
@@ -309,6 +311,11 @@ cfg = {
             "users": [{"username": u["naive_username"], "password": u["naive_password"]} for u in users],
             "tls": tls(["h2"]),
         },
+        {
+            "type": "http", "tag": "https-in", "listen": "::", "listen_port": https_port,
+            "users": [{"username": u["https_username"], "password": u["https_password"]} for u in users],
+            "tls": tls(["h2", "http/1.1"]),
+        },
     ],
     "outbounds": [{"type": "direct", "tag": "direct"}],
     "route": {
@@ -340,7 +347,7 @@ write_users_json() {
   [[ -f "$users_json" ]] && return 0
   cat >"$users_json" <<'JSON'
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "users": []
 }
 JSON
@@ -359,6 +366,7 @@ HY2_OBFS_PASSWORD=${HY2_OBFS_PASSWORD}
 ANYTLS_PORT=${ANYTLS_PORT}
 TUIC_PORT=${TUIC_PORT}
 NAIVE_PORT=${NAIVE_PORT}
+HTTPS_PORT=${HTTPS_PORT}
 INTERNAL_PROXY_TOKEN=${INTERNAL_PROXY_TOKEN}
 EOF
   secure_state_file "$STATE_DIR/public.env" "$WEB_SERVICE_GROUP"
@@ -678,7 +686,7 @@ EOF
 
   cat >"$SYSTEMD_DIR/proxy-stack-sing-box.service" <<EOF
 [Unit]
-Description=Proxy Stack AnyTLS, TUIC and NaiveProxy
+Description=Proxy Stack AnyTLS, TUIC, NaiveProxy and HTTPS Proxy
 After=network-online.target
 Wants=network-online.target
 

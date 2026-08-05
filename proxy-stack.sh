@@ -219,6 +219,7 @@ WEB_TLS_PORT=${WEB_TLS_PORT}
 ANYTLS_PORT=${ANYTLS_PORT}
 TUIC_PORT=${TUIC_PORT}
 NAIVE_PORT=${NAIVE_PORT}
+HTTPS_PORT=${HTTPS_PORT}
 INTERNAL_PROXY_TOKEN=${internal_proxy_token}
 SECURITY_SCHEMA_VERSION=${security_schema}
 EOF
@@ -1401,14 +1402,14 @@ user_show() {
   require_root
   local key="${1:?必须提供用户名称或 slug}"
   load_env
-  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" <<'PY'
+  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" "$HTTPS_PORT" <<'PY'
 import json
 import sys
 from pathlib import Path
 from urllib.parse import quote
 
 users = json.loads(Path(sys.argv[1]).read_text()).get("users", [])
-key, domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port = sys.argv[2:12]
+key, domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port, https_port = sys.argv[2:13]
 u = None
 for item in users:
     if item["name"] == key or item["slug"] == key:
@@ -1447,6 +1448,10 @@ tuic = (
 naive = (
     f'naive+https://{quote(u["naive_username"], safe="")}:{quote(u["naive_password"], safe="")}'
     f'@{domain}:{naive_port}#{quote(u["name"] + "-naive")}'
+)
+https_proxy = (
+    f'https://{quote(u["https_username"], safe="")}:{quote(u["https_password"], safe="")}'
+    f'@{domain}:{https_port}#{quote(u["name"] + "-https")}'
 )
 print(f'用户名：{u["name"]}')
 print(f'短码：{u["slug"]}')
@@ -1459,6 +1464,7 @@ print(f'Hysteria2链接：{hy2}')
 print(f'AnyTLS链接：{anytls}')
 print(f'TUIC链接：{tuic}')
 print(f'NaiveProxy链接：{naive}')
+print(f'HTTPS代理链接：{https_proxy}')
 PY
 }
 
@@ -1466,14 +1472,14 @@ user_share() {
   require_root
   local key="${1:?必须提供用户名称或 slug}"
   load_env
-  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" <<'PY'
+  python3 - "$STATE_DIR/users.json" "$key" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" "$HTTPS_PORT" <<'PY'
 import json
 import sys
 from pathlib import Path
 from urllib.parse import quote
 
 users = json.loads(Path(sys.argv[1]).read_text()).get("users", [])
-key, domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port = sys.argv[2:12]
+key, domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port, https_port = sys.argv[2:13]
 u = None
 for item in users:
     if item["name"] == key or item["slug"] == key:
@@ -1512,6 +1518,10 @@ tuic = (
 naive = (
     f'naive+https://{quote(u["naive_username"], safe="")}:{quote(u["naive_password"], safe="")}'
     f'@{domain}:{naive_port}#{quote(u["name"] + "-naive")}'
+)
+https_proxy = (
+    f'https://{quote(u["https_username"], safe="")}:{quote(u["https_password"], safe="")}'
+    f'@{domain}:{https_port}#{quote(u["name"] + "-https")}'
 )
 print(f"""[{u['name']}]
 交付页面: https://{domain}/web/{u['slug']}{subscription_query}
@@ -1533,6 +1543,9 @@ TUIC v5:
 
 NaiveProxy:
 {naive}
+
+HTTPS Proxy:
+{https_proxy}
 """)
 PY
 }
@@ -1576,7 +1589,7 @@ user_export() {
       ;;
   esac
   out_path="$(validate_export_path "$format" "$out_path")"
-  python3 - "$STATE_DIR/users.json" "$format" "$out_path" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" <<'PY'
+  python3 - "$STATE_DIR/users.json" "$format" "$out_path" "$WEB_DOMAIN" "$PUBLIC_IP" "$REALITY_PUBLIC_KEY" "$REALITY_SNI" "$REALITY_SHORT_ID" "$HY2_OBFS_PASSWORD" "$ANYTLS_PORT" "$TUIC_PORT" "$NAIVE_PORT" "$HTTPS_PORT" <<'PY'
 import csv
 import json
 import os
@@ -1588,7 +1601,7 @@ from urllib.parse import quote
 users_path = Path(sys.argv[1])
 fmt = sys.argv[2]
 out_path = Path(sys.argv[3])
-domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port = sys.argv[4:13]
+domain, public_ip, pbk, sni, sid, obfs, anytls_port, tuic_port, naive_port, https_port = sys.argv[4:14]
 users = json.loads(users_path.read_text()).get("users", [])
 
 rows = []
@@ -1625,6 +1638,10 @@ for u in users:
         f'naive+https://{quote(u["naive_username"], safe="")}:{quote(u["naive_password"], safe="")}'
         f'@{domain}:{naive_port}#{quote(u["name"] + "-naive")}'
     )
+    https_proxy = (
+        f'https://{quote(u["https_username"], safe="")}:{quote(u["https_password"], safe="")}'
+        f'@{domain}:{https_port}#{quote(u["name"] + "-https")}'
+    )
     rows.append({
         "name": u["name"],
         "slug": u["slug"],
@@ -1638,6 +1655,7 @@ for u in users:
         "anytls": anytls,
         "tuic": tuic,
         "naive": naive,
+        "https": https_proxy,
     })
 
 out_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1647,7 +1665,7 @@ try:
         if fmt == "json":
             json.dump(rows, f, indent=2, ensure_ascii=False)
         elif fmt == "csv":
-            writer = csv.DictWriter(f, fieldnames=["name", "slug", "enabled", "web", "link", "mihomo", "node", "vless", "hy2", "anytls", "tuic", "naive"])
+            writer = csv.DictWriter(f, fieldnames=["name", "slug", "enabled", "web", "link", "mihomo", "node", "vless", "hy2", "anytls", "tuic", "naive", "https"])
             writer.writeheader()
             writer.writerows(rows)
         else:
@@ -1663,7 +1681,8 @@ try:
                     f"Hysteria2链接: {row['hy2']}\n\n"
                     f"AnyTLS链接: {row['anytls']}\n"
                     f"TUIC链接: {row['tuic']}\n"
-                    f"NaiveProxy链接: {row['naive']}\n\n"
+                    f"NaiveProxy链接: {row['naive']}\n"
+                    f"HTTPS代理链接: {row['https']}\n\n"
                 )
         f.flush()
         os.fsync(f.fileno())

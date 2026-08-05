@@ -31,6 +31,7 @@ VLESS_INTERNAL_PORT="10443"
 ANYTLS_PORT="8443"
 TUIC_PORT="8443"
 NAIVE_PORT="8444"
+HTTPS_PORT="8445"
 PROXY_STACK_LOG_FILE="${PROXY_STACK_LOG_FILE:-/var/log/proxy-stack.log}"
 
 log() {
@@ -456,6 +457,7 @@ ensure_env_defaults() {
   grep -q '^ANYTLS_PORT=' "$env_file" || printf 'ANYTLS_PORT=%s\n' "$ANYTLS_PORT" >>"$env_file"
   grep -q '^TUIC_PORT=' "$env_file" || printf 'TUIC_PORT=%s\n' "$TUIC_PORT" >>"$env_file"
   grep -q '^NAIVE_PORT=' "$env_file" || printf 'NAIVE_PORT=%s\n' "$NAIVE_PORT" >>"$env_file"
+  grep -q '^HTTPS_PORT=' "$env_file" || printf 'HTTPS_PORT=%s\n' "$HTTPS_PORT" >>"$env_file"
   if ! grep -Eq '^INTERNAL_PROXY_TOKEN=[A-Za-z0-9_-]{40,}$' "$env_file"; then
     internal_proxy_token="$(random_token 32)"
     printf 'INTERNAL_PROXY_TOKEN=%s\n' "$internal_proxy_token" >>"$env_file"

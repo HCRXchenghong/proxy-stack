@@ -45,6 +45,7 @@ def validate_runtime_env(env: dict) -> bool:
         "ANYTLS_PORT",
         "TUIC_PORT",
         "NAIVE_PORT",
+        "HTTPS_PORT",
         "INTERNAL_PROXY_TOKEN",
     )
     if not isinstance(env, dict) or any(not isinstance(env.get(key), str) for key in required):
@@ -54,7 +55,10 @@ def validate_runtime_env(env: dict) -> bool:
     try:
         if not isinstance(ipaddress.ip_address(env["PUBLIC_IP"]), ipaddress.IPv4Address):
             return False
-        if any(not 1 <= int(env[key]) <= 65535 for key in ("ANYTLS_PORT", "TUIC_PORT", "NAIVE_PORT")):
+        ports = {key: int(env[key]) for key in ("ANYTLS_PORT", "TUIC_PORT", "NAIVE_PORT", "HTTPS_PORT")}
+        if any(not 1 <= value <= 65535 for value in ports.values()):
+            return False
+        if len({443, ports["ANYTLS_PORT"], ports["NAIVE_PORT"], ports["HTTPS_PORT"]}) != 4:
             return False
     except ValueError:
         return False
@@ -183,7 +187,12 @@ def raw_links(env: dict, user: dict):
         f'{quote(user["naive_password"], safe="")}@{env["WEB_DOMAIN"]}:{env["NAIVE_PORT"]}'
         f'#{quote(name + "-naive")}'
     )
-    return vless, hy2, anytls, tuic, naive
+    https_proxy = (
+        f'https://{quote(user["https_username"], safe="")}:'
+        f'{quote(user["https_password"], safe="")}@{env["WEB_DOMAIN"]}:{env["HTTPS_PORT"]}'
+        f'#{quote(name + "-https")}'
+    )
+    return vless, hy2, anytls, tuic, naive, https_proxy
 
 
 def render_clash(env: dict, user: dict):
@@ -194,6 +203,7 @@ def render_clash(env: dict, user: dict):
         "hy2": f'{user["name"]}-hy2',
         "anytls": f'{user["name"]}-anytls',
         "tuic": f'{user["name"]}-tuic',
+        "https": f'{user["name"]}-https',
     }
     base = f"""mixed-port: 7890
 allow-lan: false
@@ -253,6 +263,15 @@ proxies:
     reduce-rtt: false
     udp-relay-mode: native
     congestion-controller: bbr
+  - name: {yaml_string(names['https'])}
+    type: http
+    server: {yaml_string(env['WEB_DOMAIN'])}
+    port: {env['HTTPS_PORT']}
+    username: {yaml_string(user['https_username'])}
+    password: {yaml_string(user['https_password'])}
+    tls: true
+    sni: {yaml_string(env['WEB_DOMAIN'])}
+    skip-cert-verify: false
 proxy-groups:
   - name: "AUTO"
     type: select
@@ -261,13 +280,14 @@ proxy-groups:
       - {yaml_string(names['hy2'])}
       - {yaml_string(names['anytls'])}
       - {yaml_string(names['tuic'])}
+      - {yaml_string(names['https'])}
 rules:
   - MATCH,AUTO
 """
 
 
 def render_html(env: dict, user: dict, client_token: str = "", csp_nonce: str = ""):
-    vless, hy2, anytls, tuic, naive = raw_links(env, user)
+    vless, hy2, anytls, tuic, naive, https_proxy = raw_links(env, user)
     slug = user["slug"]
     query = f"?client={quote(client_token, safe='')}" if client_token else ""
     page_url = f"https://{env['WEB_DOMAIN']}/web/{slug}{query}"
@@ -455,6 +475,11 @@ def render_html(env: dict, user: dict, client_token: str = "", csp_nonce: str = 
         <div class="card-title">NaiveProxy（独立客户端）</div>
         <code class="url" id="naive">{html.escape(naive)}</code>
         <div class="actions"><button class="primary" data-copy="naive">复制</button></div>
+      </div>
+      <div class="card wide">
+        <div class="card-title">HTTPS Proxy（TLS 1.3）</div>
+        <code class="url" id="https-proxy">{html.escape(https_proxy)}</code>
+        <div class="actions"><button class="primary" data-copy="https-proxy">复制</button></div>
       </div>
     </div>
   </main>
